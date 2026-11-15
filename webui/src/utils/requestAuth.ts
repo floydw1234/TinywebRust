@@ -1,4 +1,5 @@
 import sodium from 'libsodium-wrappers'
+import { sha256 } from '@noble/hashes/sha2.js'
 import keyStore from './keystore'
 
 /**
@@ -10,10 +11,12 @@ import keyStore from './keystore'
  * signed with the identity Ed25519 key. Sent as headers:
  *   X-User-Pubkey, X-Signature, X-Timestamp
  *
- * Note: SHA-256 comes from libsodium (crypto_hash_sha256), not WebCrypto,
- * because this page is served over plain HTTP on a Tailscale IP, which is
- * not a "secure context" — crypto.subtle would be unavailable there.
- * The digest bytes are identical either way.
+ * Note: SHA-256 comes from @noble/hashes, not WebCrypto, because this
+ * page may be served over plain HTTP on a Tailscale IP, which is not a
+ * "secure context" — crypto.subtle would be unavailable there. (The
+ * standard libsodium-wrappers build does not export crypto_hash_sha256;
+ * that function exists only in the -sumo build.) The digest bytes are
+ * identical either way.
  */
 
 function computeRequestDigest(
@@ -41,7 +44,7 @@ function computeRequestDigest(
     combined.set(p, offset)
     offset += p.length
   }
-  return sodium.crypto_hash_sha256(combined)
+  return sha256(combined)
 }
 
 export interface AuthHeaders {

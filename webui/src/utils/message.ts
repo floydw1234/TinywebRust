@@ -1,4 +1,7 @@
 import sodium from 'libsodium-wrappers'
+// SHA-256 comes from @noble/hashes: the standard libsodium-wrappers build
+// does not export crypto_hash_sha256 (it exists only in the -sumo build).
+import { sha256 } from '@noble/hashes/sha2.js'
 import keyStore from './keystore'
 import { encryptPayloadMulti } from './encryption'
 import type { MessageHeaderData, TinyMessage } from './protobuf'
@@ -12,10 +15,6 @@ import type { MessageHeaderData, TinyMessage } from './protobuf'
  *                  SHA256(ciphertext) )
  * Plaintext is the raw UTF-8 message text, as in the C web-ui.
  */
-
-function sha256(data: Uint8Array): Uint8Array {
-  return sodium.crypto_hash_sha256(data)
-}
 
 function u32le(v: number): Uint8Array {
   const b = new Uint8Array(4)

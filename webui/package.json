@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "libsodium-wrappers": "^0.8.4",
     "protobufjs": "^8.8.1",
     "react": "^19.3.1",
