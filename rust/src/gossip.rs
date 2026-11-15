@@ -298,6 +298,7 @@ pub fn envelope_content_type_name(content_type: u32) -> &'static str {
         158 => "CommunityPostCreate",
         159 => "SharedAlbumCreate",
         160 => "MediaAddToAlbumRequest",
+        162 => "CalendarEvent",
         161 => "CollaborativeProjectCreate",
         _ => "Unknown",
     }
@@ -1026,6 +1027,23 @@ impl IngestPipeline {
             let store = self.store.lock().unwrap();
             crate::sessions::verify_share_envelope(&store, envelope, now_epoch())
                 .map_err(|e| Error::Validation(format!("group key share rejected: {e}")))?;
+        }
+
+        // 2c. Calendar events (Phase C3) get the same
+        // content-level verification before anything is stored
+        // or forwarded: the record signature must verify, the
+        // acting device must be enrolled and currently
+        // trusted, the actor must be the creator or a recorded
+        // parent of the creator, and the version must not
+        // regress what this node already holds. (Like shares,
+        // event envelopes name a device key as sender, so the
+        // step-2 node-trust check above still gates which
+        // *nodes* may relay them; cross-box event sync rides
+        // the Phase E linking work, as share sync does.)
+        if header.content_type == crate::events::CONTENT_CALENDAR_EVENT {
+            let store = self.store.lock().unwrap();
+            crate::events::verify_event_envelope(&store, envelope, now_epoch())
+                .map_err(|e| Error::Validation(format!("calendar event rejected: {e}")))?;
         }
 
         // 3. Deduplication: SHA-256 of the serialized envelope.

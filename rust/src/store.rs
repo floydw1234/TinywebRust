@@ -27,7 +27,7 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
 use crate::proto::{
-    ClientRequest, ClientRequestHeader, ClientRequestKeyWrap, ConversationList,
+    CalendarEvent, ClientRequest, ClientRequestHeader, ClientRequestKeyWrap, ConversationList,
     ConversationSummary, DeviceCertificate, DeviceRevocation, Envelope, EnvelopeHeader,
     Message, MessageHeader, MessageRecipientKeyWrap, RecipientKeyWrap, StoredEnvelope,
 };
@@ -453,6 +453,47 @@ pub struct GroupRecord {
     /// Creation time (epoch seconds).
     pub created_at: u64,
 }
+
+/// One row of the `events` projection (Phase C3): the newest
+/// held version of one calendar event. The projection is
+/// derived from `CONTENT_CALENDAR_EVENT` envelopes in
+/// `gossip_envelopes` (the source of truth) and is rebuildable
+/// at any time via [`Store::events_project_pending`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    /// The stable event id (16 bytes).
+    pub event_id: Vec<u8>,
+    /// Event title.
+    pub title: String,
+    /// Free-text notes (iCalendar DESCRIPTION).
+    pub notes: String,
+    /// Free-text location.
+    pub location: String,
+    /// Start instant (epoch seconds).
+    pub start_unix: i64,
+    /// End instant (epoch seconds).
+    pub end_unix: i64,
+    /// IANA timezone the start/end wall times belong to.
+    pub timezone: String,
+    /// All-day event (iCalendar VALUE=DATE form).
+    pub all_day: bool,
+    /// iCalendar RRULE value; empty for a one-off event.
+    pub rrule: String,
+    /// The member who created the event (immutable across
+    /// versions).
+    pub created_by: [u8; PUBKEY_SIZE],
+    /// Creation time of the first version (epoch seconds).
+    pub created_at: u64,
+    /// The version clock: `updated_at` of the held version.
+    pub updated_at: u64,
+    /// True when the held version is a tombstone.
+    pub deleted: bool,
+    /// Digest of the envelope that carried the held version
+    /// (the same-clock tiebreak, so boxes converge).
+    pub envelope_digest: [u8; GOSSIP_SEEN_DIGEST_SIZE],
+    /// The held version's serialized `CalendarEvent` record.
+    pub payload: Vec<u8>,
+}
 /// (William's decision, Nov 14, 2026): how much of the child's
 /// group chats a parent who is NOT a conversation member may
 /// see. Stored per child in `visibility_settings`.
@@ -746,6 +787,9 @@ const CREATE_CONVERSATION_MEMBERS: &str = "CREATE TABLE IF NOT EXISTS conversati
 const CREATE_GROUPS: &str = "CREATE TABLE IF NOT EXISTS groups ( group_id BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '', creator_pubkey BLOB NOT NULL, created_at INTEGER NOT NULL);";
 const CREATE_GROUP_RETIRED_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS group_retired_sessions ( session_id BLOB PRIMARY KEY, group_id BLOB NOT NULL, retired_at INTEGER NOT NULL);";
 const CREATE_MESSAGE_SESSION_RECIPIENTS: &str = "CREATE TABLE IF NOT EXISTS message_session_recipients ( id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, recipient_pubkey BLOB NOT NULL, FOREIGN KEY (message_id) REFERENCES user_messages(id) ON DELETE CASCADE);";
+const CREATE_EVENTS: &str = "CREATE TABLE IF NOT EXISTS events ( event_id BLOB PRIMARY KEY, title TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', start_unix INTEGER NOT NULL DEFAULT 0, end_unix INTEGER NOT NULL DEFAULT 0, timezone TEXT NOT NULL DEFAULT '', all_day INTEGER NOT NULL DEFAULT 0, rrule TEXT NOT NULL DEFAULT '', created_by BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0, envelope_digest BLOB NOT NULL, payload BLOB NOT NULL);";
+const CREATE_EVENTS_META: &str = "CREATE TABLE IF NOT EXISTS events_meta ( key TEXT PRIMARY KEY, value INTEGER NOT NULL);";
+const CREATE_IDX_EVENTS_START: &str = "CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_unix);";
 
 /// Statements of `gossip_store_init`, in C execution order.
 const GOSSIP_SCHEMA: &[&str] = &[
@@ -3017,6 +3061,229 @@ impl Store {
         Ok(count > 0)
     }
 
+    // -- calendar events (Phase C3) ------------------------------
+
+    /// Create the events projection tables if needed (lazy,
+    /// like [`Store::groups_init`]). The projection is derived
+    /// state: `gossip_envelopes` stays the source of truth.
+    pub fn events_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_EVENTS)?;
+        self.conn.execute_batch(CREATE_EVENTS_META)?;
+        self.conn.execute_batch(CREATE_IDX_EVENTS_START)?;
+        Ok(())
+    }
+
+    /// Fold every `CONTENT_CALENDAR_EVENT` envelope stored
+    /// since the last projection pass into the events table,
+    /// in envelope order. Returns how many versions actually
+    /// changed the projection. Called before every events
+    /// read and every event verification, so envelopes that
+    /// arrived via gossip are projected exactly like envelopes
+    /// submitted over the API. The high-water mark lives in
+    /// `events_meta`; deleting the projection tables and
+    /// re-running this rebuilds the calendar from the envelope
+    /// store alone.
+    pub fn events_project_pending(&self) -> Result<usize> {
+        self.events_init()?;
+        let watermark: i64 = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT value FROM events_meta WHERE key = 'last_envelope_id'")?;
+            let mut rows = stmt.query(params![])?;
+            match rows.next()? {
+                Some(row) => row.get(0)?,
+                None => 0,
+            }
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, version, content_type, schema_version, timestamp, sender, group_id, payload_nonce, ephemeral_pubkey, encrypted_payload, signature FROM gossip_envelopes WHERE content_type = ? AND id > ? ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![crate::events::CONTENT_CALENDAR_EVENT as i64, watermark],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                ))
+            },
+        )?;
+        let mut raw = Vec::new();
+        for r in rows {
+            raw.push(r?);
+        }
+        drop(stmt);
+        let mut max_id = watermark;
+        let mut applied = 0usize;
+        for (id, v, ct, sv, ts, sender, gid, nonce, eph, payload, sig) in &raw {
+            max_id = max_id.max(*id);
+            let envelope = self.reconstruct_envelope(
+                *id,
+                *v as u32,
+                *ct as u32,
+                *sv as u32,
+                *ts as u64,
+                sender,
+                gid.as_deref(),
+                nonce,
+                eph,
+                payload,
+                sig,
+            )?;
+            let Some(envelope) = envelope else {
+                eprintln!(
+                    "events: projection skipped envelope {id}: stored row cannot be reconstructed"
+                );
+                continue;
+            };
+            let event = match CalendarEvent::decode(envelope.payload_ciphertext.as_slice()) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "events: projection skipped envelope {id}: payload does not decode as CalendarEvent: {e}"
+                    );
+                    continue;
+                }
+            };
+            let digest = location_store_compute_digest_envelope(&envelope);
+            if self.event_apply_version(&event, &digest)? {
+                applied += 1;
+            }
+        }
+        if max_id > watermark {
+            self.conn.execute(
+                "INSERT INTO events_meta (key, value) VALUES ('last_envelope_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![max_id],
+            )?;
+        }
+        Ok(applied)
+    }
+
+    /// Apply one event version to the projection under the
+    /// version rule: a strictly newer `updated_at` wins; at
+    /// the same `updated_at` an identical payload is a no-op
+    /// and a different payload wins only when its envelope
+    /// digest is greater (a deterministic tiebreak, so every
+    /// box converges on the same version). Returns whether
+    /// the projection changed. Does NOT run the pending
+    /// projection pass — callers that need current state use
+    /// [`Store::event_get`] / [`Store::events_list_range`].
+    pub fn event_apply_version(
+        &self,
+        event: &CalendarEvent,
+        envelope_digest: &[u8; GOSSIP_SEEN_DIGEST_SIZE],
+    ) -> Result<bool> {
+        self.events_init()?;
+        if let Some(current) = self.event_row(&event.event_id)? {
+            // The creator is immutable: a version naming a
+            // different creator is not this event, whatever its
+            // clock says (verification rejects these at ingest;
+            // the projection upholds it on its own too).
+            if event.created_by != current.created_by {
+                let id_hex: String = event
+                    .event_id
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                eprintln!(
+                    "events: projection ignored version of event {id_hex} naming a different creator"
+                );
+                return Ok(false);
+            }
+            if event.updated_at < current.updated_at {
+                return Ok(false);
+            }
+            if event.updated_at == current.updated_at {
+                if event.encode_to_vec() == current.payload {
+                    return Ok(false);
+                }
+                if envelope_digest[..] <= current.envelope_digest[..] {
+                    return Ok(false);
+                }
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO events (event_id, title, notes, location, start_unix, end_unix, timezone, all_day, rrule, created_by, created_at, updated_at, deleted, envelope_digest, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET title = excluded.title, notes = excluded.notes, location = excluded.location, start_unix = excluded.start_unix, end_unix = excluded.end_unix, timezone = excluded.timezone, all_day = excluded.all_day, rrule = excluded.rrule, updated_at = excluded.updated_at, deleted = excluded.deleted, envelope_digest = excluded.envelope_digest, payload = excluded.payload",
+            params![
+                &event.event_id[..],
+                event.title,
+                event.notes,
+                event.location,
+                event.start_unix,
+                event.end_unix,
+                event.timezone,
+                event.all_day as i64,
+                event.rrule,
+                &event.created_by[..],
+                event.created_at as i64,
+                event.updated_at as i64,
+                event.deleted as i64,
+                &envelope_digest[..],
+                event.encode_to_vec(),
+            ],
+        )?;
+        Ok(true)
+    }
+
+    /// The projection row for one event, without running the
+    /// pending projection pass.
+    fn event_row(&self, event_id: &[u8]) -> Result<Option<EventRecord>> {
+        self.events_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, title, notes, location, start_unix, end_unix, timezone, all_day, rrule, created_by, created_at, updated_at, deleted, envelope_digest, payload FROM events WHERE event_id = ?",
+        )?;
+        let mut rows = stmt.query(params![event_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(event_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// One event's currently held version (projection brought
+    /// current first), `Ok(None)` when the id is unknown.
+    pub fn event_get(&self, event_id: &[u8]) -> Result<Option<EventRecord>> {
+        self.events_project_pending()?;
+        self.event_row(event_id)
+    }
+
+    /// Events in a range, newest version per id, ordered by
+    /// start then id. Range rule: the range is half-open
+    /// `[from, to)` over event starts — a one-off event is in
+    /// the range when `from <= start < to`; a recurring event
+    /// (non-empty RRULE) is in the range when its series start
+    /// is before `to` (occurrences are not expanded in this
+    /// phase, so a series that began earlier is surfaced for
+    /// any range it may reach into). Tombstones are excluded
+    /// unless `include_deleted` is set.
+    pub fn events_list_range(
+        &self,
+        from: i64,
+        to: i64,
+        include_deleted: bool,
+    ) -> Result<Vec<EventRecord>> {
+        self.events_project_pending()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, title, notes, location, start_unix, end_unix, timezone, all_day, rrule, created_by, created_at, updated_at, deleted, envelope_digest, payload FROM events WHERE (deleted = 0 OR ?1) AND ((rrule = '' AND start_unix >= ?2 AND start_unix < ?3) OR (rrule <> '' AND start_unix < ?3)) ORDER BY start_unix ASC, event_id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![include_deleted as i64, from, to],
+            event_from_row,
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Register a user directly (founding bootstrap and tests):
     /// an active `users` row for `user_pubkey` under `username`.
     /// A no-op when the pubkey is already registered.
@@ -3372,6 +3639,36 @@ fn group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GroupRecord> {
         name: row.get(1)?,
         creator_pubkey,
         created_at: row.get::<_, i64>(3)? as u64,
+    })
+}
+
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let creator_blob: Vec<u8> = row.get(9)?;
+    let mut created_by = [0u8; PUBKEY_SIZE];
+    if creator_blob.len() == PUBKEY_SIZE {
+        created_by.copy_from_slice(&creator_blob);
+    }
+    let digest_blob: Vec<u8> = row.get(13)?;
+    let mut envelope_digest = [0u8; GOSSIP_SEEN_DIGEST_SIZE];
+    if digest_blob.len() == GOSSIP_SEEN_DIGEST_SIZE {
+        envelope_digest.copy_from_slice(&digest_blob);
+    }
+    Ok(EventRecord {
+        event_id: row.get(0)?,
+        title: row.get(1)?,
+        notes: row.get(2)?,
+        location: row.get(3)?,
+        start_unix: row.get(4)?,
+        end_unix: row.get(5)?,
+        timezone: row.get(6)?,
+        all_day: row.get::<_, i64>(7)? != 0,
+        rrule: row.get(8)?,
+        created_by,
+        created_at: row.get::<_, i64>(10)? as u64,
+        updated_at: row.get::<_, i64>(11)? as u64,
+        deleted: row.get::<_, i64>(12)? != 0,
+        envelope_digest,
+        payload: row.get(14)?,
     })
 }
 
@@ -4784,6 +5081,143 @@ mod tests {
         let session_back = by_ts[&1_700_000_100];
         assert_eq!(session_back.session_id, vec![0x53; 16]);
         assert_eq!(session_back.message_index, 42);
+    }
+
+    // -- calendar events (Phase C3) ------------------------------
+
+    fn event_test_member(store: &Store, name: &str) -> crate::keystore::MemberKeystore {
+        let mut ks = crate::keystore::MemberKeystore::new();
+        ks.generate_member_key().unwrap();
+        ks.add_device_key("phone").unwrap();
+        let member_pk = ks.member_public_key().unwrap();
+        let now = 1_700_000_000;
+        let cert = crate::identity::issue_device_certificate(&ks, "phone", now, 0).unwrap();
+        store.user_register(&member_pk, name).unwrap();
+        store.device_add(&cert, now).unwrap();
+        ks
+    }
+
+    fn calendar_event(
+        id_byte: u8,
+        title: &str,
+        start: i64,
+        updated_at: u64,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            event_id: vec![id_byte; 16],
+            title: title.to_string(),
+            notes: String::new(),
+            location: String::new(),
+            start_unix: start,
+            end_unix: start + 3600,
+            timezone: "America/Denver".to_string(),
+            all_day: false,
+            rrule: String::new(),
+            created_by: Vec::new(),
+            actor_member_pubkey: Vec::new(),
+            actor_device_pubkey: Vec::new(),
+            created_at: updated_at,
+            updated_at,
+            deleted: false,
+            signature: Vec::new(),
+        }
+    }
+
+    fn store_event_version(
+        store: &Store,
+        ks: &crate::keystore::MemberKeystore,
+        event: &CalendarEvent,
+    ) {
+        let envelope = crate::events::build_event_envelope(ks, "phone", event).unwrap();
+        store
+            .gossip_store_save_envelope(&envelope, u64::MAX / 2)
+            .unwrap();
+    }
+
+    #[test]
+    fn events_projection_latest_wins_tombstone_and_rebuild() {
+        let store = test_store();
+        let alice = event_test_member(&store, "Alice");
+        let alice_pk = alice.member_public_key().unwrap();
+
+        // Create + update + tombstone, all as envelopes in the
+        // gossip store; the projection folds them in order.
+        store_event_version(&store, &alice, &calendar_event(0xE1, "Hike", 1_800_000_000, 100));
+        let mut update = calendar_event(0xE1, "Hike (longer)", 1_800_000_000, 200);
+        update.created_at = 100;
+        store_event_version(&store, &alice, &update);
+
+        let list = store
+            .events_list_range(1_800_000_000, 1_800_100_000, false)
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "Hike (longer)");
+        assert_eq!(list[0].created_by, alice_pk);
+        assert_eq!(list[0].created_at, 100);
+        assert_eq!(list[0].updated_at, 200);
+        assert!(!list[0].deleted);
+
+        // An older version arriving late changes nothing.
+        let mut stale = calendar_event(0xE1, "Hike (stale)", 1_800_000_000, 150);
+        stale.created_at = 100;
+        store_event_version(&store, &alice, &stale);
+        let list = store
+            .events_list_range(1_800_000_000, 1_800_100_000, false)
+            .unwrap();
+        assert_eq!(list[0].title, "Hike (longer)");
+
+        // The tombstone hides the event by default and shows
+        // with include_deleted.
+        let mut tombstone = calendar_event(0xE1, "Hike (longer)", 1_800_000_000, 300);
+        tombstone.created_at = 100;
+        tombstone.deleted = true;
+        store_event_version(&store, &alice, &tombstone);
+        assert!(store
+            .events_list_range(1_800_000_000, 1_800_100_000, false)
+            .unwrap()
+            .is_empty());
+        let with_deleted = store
+            .events_list_range(1_800_000_000, 1_800_100_000, true)
+            .unwrap();
+        assert_eq!(with_deleted.len(), 1);
+        assert!(with_deleted[0].deleted);
+
+        // The projection is rebuildable: wipe it and the
+        // watermark, and the same calendar comes back from
+        // the envelope store alone.
+        store
+            .connection()
+            .execute_batch("DELETE FROM events; DELETE FROM events_meta;")
+            .unwrap();
+        let rebuilt = store
+            .events_list_range(1_800_000_000, 1_800_100_000, true)
+            .unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].title, "Hike (longer)");
+        assert!(rebuilt[0].deleted);
+    }
+
+    #[test]
+    fn events_range_boundaries_and_recurring() {
+        let store = test_store();
+        let alice = event_test_member(&store, "Alice");
+        // One-off at exactly 1000..4600; range is [2000, 3000).
+        store_event_version(&store, &alice, &calendar_event(0xE2, "One-off", 1000, 100));
+        let in_range = store.events_list_range(1000, 1001, false).unwrap();
+        assert_eq!(in_range.len(), 1, "start == from is included");
+        assert!(store.events_list_range(0, 1000, false).unwrap().is_empty(), "start == to is excluded");
+        assert!(store.events_list_range(1001, 2000, false).unwrap().is_empty(), "start < from is excluded");
+
+        // A recurring series that started before the range is
+        // surfaced for a later range, RRULE intact; the one-off
+        // is not.
+        let mut recurring = calendar_event(0xE3, "Weekly standup", 1000, 100);
+        recurring.rrule = "FREQ=WEEKLY".to_string();
+        store_event_version(&store, &alice, &recurring);
+        let later = store.events_list_range(5000, 6000, false).unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].title, "Weekly standup");
+        assert_eq!(later[0].rrule, "FREQ=WEEKLY");
     }
 }
 

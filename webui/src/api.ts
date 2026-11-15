@@ -474,3 +474,67 @@ export async function getContentRecent(
   throwIfError(r, 'Failed to fetch content')
   return (r.json?.envelopes || []) as FetchedEnvelope[]
 }
+
+// ---- Events (Phase C3) ----
+
+export interface NodeEvent {
+  event_id: string // hex, 16 bytes
+  title: string
+  notes: string
+  location: string
+  start_unix: number
+  end_unix: number
+  timezone: string
+  all_day: boolean
+  rrule: string
+  recurring: boolean
+  created_by: string // hex member pubkey
+  created_at: number
+  updated_at: number
+  deleted: boolean
+}
+
+/** GET /events?from=&to= — the household calendar in a range. */
+export async function getEvents(
+  from: number,
+  to: number,
+  includeDeleted = false,
+): Promise<NodeEvent[]> {
+  const q = `from=${from}&to=${to}${includeDeleted ? '&include_deleted=1' : ''}`
+  const r = await rawFetch('GET', `/events?${q}`, { signed: true })
+  throwIfError(r, 'Failed to list events')
+  return (r.json?.events || []) as NodeEvent[]
+}
+
+/** POST /events — issue an event version (body: signed event envelope). */
+export async function submitEvent(envelopeBytes: Uint8Array): Promise<unknown> {
+  const r = await rawFetch('POST', '/events', {
+    signed: true,
+    headers: { 'Content-Type': 'application/x-protobuf' },
+    body: envelopeBytes as BodyInit,
+  })
+  throwIfError(r, 'Failed to create event')
+  return r.json ?? r.text
+}
+
+/** PUT /events/:id — issue a new version of one event. */
+export async function updateEvent(eventIdHex: string, envelopeBytes: Uint8Array): Promise<unknown> {
+  const r = await rawFetch('PUT', `/events/${eventIdHex}`, {
+    signed: true,
+    headers: { 'Content-Type': 'application/x-protobuf' },
+    body: envelopeBytes as BodyInit,
+  })
+  throwIfError(r, 'Failed to update event')
+  return r.json ?? r.text
+}
+
+/** DELETE /events/:id — the body carries the signed tombstone envelope. */
+export async function deleteEvent(eventIdHex: string, envelopeBytes: Uint8Array): Promise<unknown> {
+  const r = await rawFetch('DELETE', `/events/${eventIdHex}`, {
+    signed: true,
+    headers: { 'Content-Type': 'application/x-protobuf' },
+    body: envelopeBytes as BodyInit,
+  })
+  throwIfError(r, 'Failed to delete event')
+  return r.json ?? r.text
+}

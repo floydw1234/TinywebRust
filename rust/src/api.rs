@@ -36,11 +36,11 @@ use sha2::{Digest, Sha256};
 
 use crate::gossip::GossipService;
 use crate::proto::{
-    ClientRequest, ConversationList, DeviceCertificate, Envelope, GroupKeyShare, Message,
-    MessageList,
+    CalendarEvent, ClientRequest, ConversationList, DeviceCertificate, Envelope, GroupKeyShare,
+    Message, MessageList,
 };
 use crate::store::{
-    DeviceStatus, GroupRecord, PermissionScope, Store, PERMISSION_VIEW_LOCATION,
+    DeviceStatus, EventRecord, GroupRecord, PermissionScope, Store, PERMISSION_VIEW_LOCATION,
     PUBKEY_SIZE,
 };
 use crate::validation::{
@@ -501,6 +501,10 @@ pub enum Route {
     ContentRecent,
     /// `GET /groups/:id/share-recipients` (Phase C2)
     GroupShareRecipients { group_id: String },
+    /// `GET|POST /events` (Phase C3, DESIGN.md §5)
+    Events,
+    /// `GET|PUT|POST|DELETE /events/:id` (Phase C3)
+    Event { event_id: String },
     /// No route matched: C replies 404.
     NotFound,
 }
@@ -528,7 +532,15 @@ pub fn route(path: &str) -> Route {
         "/content/recent" => Route::ContentRecent,
         "/devices" => Route::Devices,
         "/devices/revoke" => Route::RevokeDevice,
+        "/events" => Route::Events,
         _ => {
+            if let Some(rest) = path.strip_prefix("/events/") {
+                if !rest.is_empty() && !rest.contains('/') {
+                    return Route::Event {
+                        event_id: rest.to_string(),
+                    };
+                }
+            }
             if let Some(rest) = path.strip_prefix("/groups/") {
                 let parts: Vec<&str> = rest.split('/').collect();
                 match parts.as_slice() {
@@ -578,6 +590,8 @@ fn allowed_methods_for(path: &str) -> &'static str {
         | "/enroll/approve" | "/devices/revoke" | "/content/submit" => "POST, OPTIONS",
         "/groups" => "GET, POST, OPTIONS",
         _ if path.starts_with("/groups/") => "GET, POST, DELETE, OPTIONS",
+        "/events" => "GET, POST, OPTIONS",
+        _ if path.starts_with("/events/") => "GET, POST, PUT, DELETE, OPTIONS",
         "/content/recent" => "GET, OPTIONS",
         "/gossip/peers"
         | "/health"
@@ -971,6 +985,17 @@ pub fn handle_request(state: &ApiState, request: &Request) -> Response {
         },
         Route::GroupShareRecipients { group_id } => match request.method.as_str() {
             "GET" => handle_group_share_recipients(state, request, &group_id),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::Events => match request.method.as_str() {
+            "POST" => handle_create_event(state, request),
+            "GET" => handle_list_events(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::Event { event_id } => match request.method.as_str() {
+            "GET" => handle_get_event(state, request, &event_id),
+            "PUT" | "POST" => handle_update_event(state, request, &event_id),
+            "DELETE" => handle_delete_event(state, request, &event_id),
             _ => Response::json_error(405, "Method Not Allowed"),
         },
         Route::NotFound => Response::json_error(404, "Not Found"),
@@ -2587,6 +2612,11 @@ fn content_reject(context: &str, reason: &str) {
 ///   a member of the envelope's group, and every recipient
 ///   must be a registered user. (The payload is encrypted to
 ///   the parent; the node checks headers only.)
+/// - 162 (`CONTENT_CALENDAR_EVENT`): a calendar event version
+///   (Phase C3), verified in full by
+///   [`crate::events::verify_event_envelope`]; the requester
+///   must be the record's acting member. The stored envelope
+///   is folded into the events projection before replying.
 /// Anything else is refused and logged — the typed endpoints
 /// (messages, location) remain the path for their own types.
 fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
@@ -2625,6 +2655,7 @@ fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
 
     // Per-type authorization and content verification, under
     // one store lock; storage happens below on success.
+    let mut event_submit: Option<CalendarEvent> = None;
     let share_audit: Option<(GroupKeyShare, [u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE])> = {
         let store = state.store.lock().unwrap();
         match content_type {
@@ -2715,6 +2746,40 @@ fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
                 }
                 None
             }
+            crate::events::CONTENT_CALENDAR_EVENT => {
+                // Calendar events (Phase C3): the record is
+                // verified in full (signatures, actor
+                // enrollment, creator/parent authorization,
+                // version rule) by the events module. The
+                // requester must be the acting member — the
+                // member whose device signed the record.
+                let event = match crate::events::verify_event_envelope(&store, &envelope, now) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        content_reject("submit event", &format!("event rejected: {e}"));
+                        return Response::json_error(
+                            403,
+                            &format!("Calendar event rejected: {e}"),
+                        );
+                    }
+                };
+                if event.actor_member_pubkey != requester.as_slice() {
+                    content_reject(
+                        "submit event",
+                        &format!(
+                            "event actor member {} is not the requester {}",
+                            hex_encode(&event.actor_member_pubkey),
+                            hex_encode(&requester)
+                        ),
+                    );
+                    return Response::json_error(
+                        403,
+                        "Event actor must be the requesting member",
+                    );
+                }
+                event_submit = Some(event);
+                None
+            }
             other => {
                 content_reject(
                     "submit",
@@ -2730,7 +2795,15 @@ fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
 
     // Dedup + store, mirroring gossip ingest steps 3-4.
     let digest = crate::store::location_store_compute_digest_envelope(&envelope);
-    let expires_at = validation::gossip_validation_expiration(&envelope, &state.validation_config);
+    let expires_at = match &event_submit {
+        // Events are retained until their end + a grace
+        // period (DESIGN.md §4.3), not on the chat TTL.
+        Some(event) => crate::events::event_expires_at(
+            event,
+            validation::gossip_validation_expiration(&envelope, &state.validation_config),
+        ),
+        None => validation::gossip_validation_expiration(&envelope, &state.validation_config),
+    };
     {
         let store = state.store.lock().unwrap();
         match store.gossip_store_has_seen(&digest) {
@@ -2753,6 +2826,12 @@ fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
                 request.body.as_slice(),
             );
         }
+        if event_submit.is_some() {
+            // Fold the new version into the events projection
+            // right away (the projection pass would catch it on
+            // the next read regardless).
+            let _ = store.events_project_pending();
+        }
     }
     // Rebroadcast to peer nodes, as the message path does; the
     // outcome is identical from the client's view.
@@ -2761,6 +2840,355 @@ fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
         let _ = service.broadcast_envelope(&envelope);
     }
     Response::json(202, "{\"status\":\"accepted\"}")
+}
+
+// -- events (Phase C3, DESIGN.md §5) -------------------------------
+
+fn events_reject(context: &str, reason: &str) {
+    eprintln!("api events: rejected {context}: {reason}");
+}
+
+fn event_json(event: &EventRecord) -> serde_json::Value {
+    json!({
+        "event_id": hex_encode(&event.event_id),
+        "title": event.title,
+        "notes": event.notes,
+        "location": event.location,
+        "start_unix": event.start_unix,
+        "end_unix": event.end_unix,
+        "timezone": event.timezone,
+        "all_day": event.all_day,
+        "rrule": event.rrule,
+        "recurring": !event.rrule.is_empty(),
+        "created_by": hex_encode(&event.created_by),
+        "created_at": event.created_at,
+        "updated_at": event.updated_at,
+        "deleted": event.deleted,
+    })
+}
+
+fn parse_event_id(context: &str, event_id_hex: &str) -> Result<Vec<u8>, Response> {
+    match hex_decode(event_id_hex) {
+        Some(id) if id.len() == crate::events::EVENT_ID_SIZE => Ok(id),
+        _ => {
+            events_reject(context, &format!("invalid event id {event_id_hex}"));
+            Err(Response::json_error(400, "Invalid event id"))
+        }
+    }
+}
+
+fn decode_event_envelope(context: &str, request: &Request) -> Result<Envelope, Response> {
+    if request.body.is_empty() {
+        events_reject(context, "empty body");
+        return Err(Response::json_error(400, "Empty body"));
+    }
+    if request.body.len() > MAX_BODY_BYTES {
+        events_reject(context, "body too large");
+        return Err(Response::json_error(413, "Payload too large"));
+    }
+    let envelope = match Envelope::decode(request.body.as_slice()) {
+        Ok(e) => e,
+        Err(_) => {
+            events_reject(context, "body is not a valid Envelope protobuf");
+            return Err(Response::json_error(400, "Invalid protobuf"));
+        }
+    };
+    match envelope.header.as_ref() {
+        Some(h) if h.content_type == crate::events::CONTENT_CALENDAR_EVENT => Ok(envelope),
+        Some(h) => {
+            events_reject(
+                context,
+                &format!("content type {} is not a calendar event", h.content_type),
+            );
+            Err(Response::json_error(400, "Not a calendar event envelope"))
+        }
+        None => {
+            events_reject(context, "envelope has no header");
+            Err(Response::json_error(400, "Invalid envelope"))
+        }
+    }
+}
+
+/// The shared event submission core behind `POST /events`,
+/// `PUT|POST /events/:id`, `DELETE /events/:id` (and, in its
+/// own flow, `/content/submit`): envelope validation, full
+/// event verification (signatures, actor enrollment,
+/// creator/parent authorization, version rule), dedup,
+/// storage with event retention, projection, broadcast.
+/// Returns the verified record and whether the envelope was
+/// already held (a duplicate, not an error).
+fn submit_event_envelope(
+    state: &ApiState,
+    requester: &[u8; PUBKEY_SIZE],
+    envelope: &Envelope,
+) -> Result<(CalendarEvent, bool), Response> {
+    if let Err(e) = validation::gossip_validate_envelope(
+        envelope,
+        &state.validation_config,
+        now_epoch(),
+    ) {
+        events_reject("submit", &format!("envelope validation failed: {e}"));
+        return Err(Response::json_error(400, &e.to_string()));
+    }
+    let event = {
+        let store = state.store.lock().unwrap();
+        match crate::events::verify_event_envelope(&store, envelope, now_epoch()) {
+            Ok(event) => event,
+            Err(e) => {
+                events_reject("submit", &format!("event rejected: {e}"));
+                return Err(Response::json_error(
+                    403,
+                    &format!("Calendar event rejected: {e}"),
+                ));
+            }
+        }
+    };
+    if event.actor_member_pubkey != requester.as_slice() {
+        events_reject(
+            "submit",
+            &format!(
+                "event actor member {} is not the requester {}",
+                hex_encode(&event.actor_member_pubkey),
+                hex_encode(requester)
+            ),
+        );
+        return Err(Response::json_error(
+            403,
+            "Event actor must be the requesting member",
+        ));
+    }
+    let digest = crate::store::location_store_compute_digest_envelope(envelope);
+    let expires_at = crate::events::event_expires_at(
+        &event,
+        validation::gossip_validation_expiration(envelope, &state.validation_config),
+    );
+    let duplicate = {
+        let store = state.store.lock().unwrap();
+        match store.gossip_store_has_seen(&digest) {
+            Ok(true) => true,
+            Ok(false) => {
+                if store.gossip_store_save_envelope(envelope, expires_at).is_err() {
+                    return Err(Response::json_error(500, "Storage failed"));
+                }
+                let _ = store.gossip_store_mark_seen(&digest, expires_at);
+                let _ = store.events_project_pending();
+                false
+            }
+            Err(_) => return Err(Response::json_error(500, "Internal error")),
+        }
+    };
+    if !duplicate {
+        if let Some(gossip) = &state.gossip {
+            let service = gossip.lock().unwrap();
+            let _ = service.broadcast_envelope(envelope);
+        }
+    }
+    Ok((event, duplicate))
+}
+
+fn event_submit_response(state: &ApiState, event: &CalendarEvent, duplicate: bool) -> Response {
+    let record = {
+        let store = state.store.lock().unwrap();
+        store.event_get(&event.event_id)
+    };
+    let status = if duplicate { "duplicate" } else { "accepted" };
+    match record {
+        Ok(Some(rec)) => Response::json(
+            202,
+            json!({ "status": status, "event": event_json(&rec) }).to_string(),
+        ),
+        _ => Response::json(202, json!({ "status": status }).to_string()),
+    }
+}
+
+/// `POST /events` — create an event (or issue any version of
+/// it): the body is one signed `CONTENT_CALENDAR_EVENT`
+/// envelope, exactly as on the generalized `/content/submit`
+/// path. Replies 202 with the projected record.
+fn handle_create_event(state: &ApiState, request: &Request) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let envelope = match decode_event_envelope("create", request) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    match submit_event_envelope(state, &requester, &envelope) {
+        Ok((event, duplicate)) => event_submit_response(state, &event, duplicate),
+        Err(r) => r,
+    }
+}
+
+/// `PUT|POST /events/:id` — issue a new version of one event;
+/// the envelope in the body must name the same event id as
+/// the path.
+fn handle_update_event(state: &ApiState, request: &Request, event_id_hex: &str) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let event_id = match parse_event_id("update", event_id_hex) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let envelope = match decode_event_envelope("update", request) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    match CalendarEvent::decode(envelope.payload_ciphertext.as_slice()) {
+        Ok(event) if event.event_id == event_id => {}
+        Ok(event) => {
+            events_reject(
+                "update",
+                &format!(
+                    "path event id {} does not match envelope event id {}",
+                    event_id_hex,
+                    hex_encode(&event.event_id)
+                ),
+            );
+            return Response::json_error(400, "Event id mismatch");
+        }
+        Err(_) => {
+            events_reject("update", "payload does not decode as CalendarEvent");
+            return Response::json_error(400, "Invalid event payload");
+        }
+    }
+    match submit_event_envelope(state, &requester, &envelope) {
+        Ok((event, duplicate)) => event_submit_response(state, &event, duplicate),
+        Err(r) => r,
+    }
+}
+
+/// `DELETE /events/:id` — delete an event by issuing its
+/// tombstone version. A deletion is a family fact, so it is
+/// content, not a bare API call (DESIGN.md §5): the body must
+/// carry the signed tombstone envelope (`deleted = true`) for
+/// the event named in the path, signed by the creator's — or
+/// a recorded parent of the creator's — device.
+fn handle_delete_event(state: &ApiState, request: &Request, event_id_hex: &str) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let event_id = match parse_event_id("delete", event_id_hex) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    if request.body.is_empty() {
+        events_reject(
+            "delete",
+            "DELETE requires the signed tombstone envelope in the body",
+        );
+        return Response::json_error(
+            400,
+            "DELETE requires the signed tombstone envelope in the body",
+        );
+    }
+    let envelope = match decode_event_envelope("delete", request) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    match CalendarEvent::decode(envelope.payload_ciphertext.as_slice()) {
+        Ok(event) if event.event_id == event_id && event.deleted => {}
+        Ok(event) if event.event_id == event_id => {
+            events_reject("delete", "envelope is not a tombstone version (deleted = false)");
+            return Response::json_error(400, "Not a tombstone version");
+        }
+        Ok(event) => {
+            events_reject(
+                "delete",
+                &format!(
+                    "path event id {} does not match envelope event id {}",
+                    event_id_hex,
+                    hex_encode(&event.event_id)
+                ),
+            );
+            return Response::json_error(400, "Event id mismatch");
+        }
+        Err(_) => {
+            events_reject("delete", "payload does not decode as CalendarEvent");
+            return Response::json_error(400, "Invalid event payload");
+        }
+    }
+    match submit_event_envelope(state, &requester, &envelope) {
+        Ok((event, duplicate)) => event_submit_response(state, &event, duplicate),
+        Err(r) => r,
+    }
+}
+
+/// `GET /events/:id` — one event's currently held version
+/// (including a tombstone; the record says `deleted`).
+fn handle_get_event(state: &ApiState, request: &Request, event_id_hex: &str) -> Response {
+    if let Err(r) = authenticate(state, request) {
+        return r;
+    }
+    let event_id = match parse_event_id("get", event_id_hex) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let record = {
+        let store = state.store.lock().unwrap();
+        store.event_get(&event_id)
+    };
+    match record {
+        Ok(Some(rec)) => Response::json(200, event_json(&rec).to_string()),
+        Ok(None) => Response::json_error(404, "Event not found"),
+        Err(_) => Response::json_error(500, "Store error"),
+    }
+}
+
+fn query_i64(request: &Request, name: &str, default: i64) -> Result<i64, Response> {
+    match request.query_var(name) {
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) => Ok(n),
+            Err(_) => {
+                events_reject("list", &format!("invalid {name} query variable"));
+                Err(Response::json_error(400, &format!("Invalid {name}")))
+            }
+        },
+        None => Ok(default),
+    }
+}
+
+/// `GET /events?from=<unix>&to=<unix>&include_deleted=1` —
+/// the household calendar in a range: the newest version of
+/// every event whose start falls in `[from, to)`, plus every
+/// recurring series that started before `to` (occurrences are
+/// not expanded in this phase; the RRULE rides along).
+/// Tombstones are hidden unless `include_deleted=1`.
+/// Defaults: from = 0, to = 2100-01-01 UTC.
+fn handle_list_events(state: &ApiState, request: &Request) -> Response {
+    if let Err(r) = authenticate(state, request) {
+        return r;
+    }
+    let from = match query_i64(request, "from", 0) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let to = match query_i64(request, "to", 4_102_444_800) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let include_deleted = matches!(
+        request.query_var("include_deleted").as_deref(),
+        Some("1") | Some("true")
+    );
+    let records = {
+        let store = state.store.lock().unwrap();
+        store.events_list_range(from, to, include_deleted)
+    };
+    match records {
+        Ok(records) => {
+            let events: Vec<serde_json::Value> = records.iter().map(event_json).collect();
+            let count = events.len();
+            Response::json(
+                200,
+                json!({ "events": events, "count": count }).to_string(),
+            )
+        }
+        Err(_) => Response::json_error(500, "Store error"),
+    }
 }
 
 /// `GET /content/recent?for=<pubkey>&content_type=<n>&limit=<n>`
@@ -5392,5 +5820,545 @@ mod tests {
         let (status, fetched) = fetch_content(&state, &b, &b.member_pk, 35);
         assert_eq!(status, 200);
         assert_eq!(fetched["count"], 1, "fetched: {fetched}");
+    }
+
+    // -- Phase C3: calendar events -------------------------------
+
+    fn sample_event(id_byte: u8, title: &str, start: i64, updated_at: u64) -> CalendarEvent {
+        CalendarEvent {
+            event_id: vec![id_byte; 16],
+            title: title.to_string(),
+            notes: String::new(),
+            location: String::new(),
+            start_unix: start,
+            end_unix: start + 3600,
+            timezone: "America/Denver".to_string(),
+            all_day: false,
+            rrule: String::new(),
+            created_by: Vec::new(),
+            actor_member_pubkey: Vec::new(),
+            actor_device_pubkey: Vec::new(),
+            created_at: updated_at,
+            updated_at,
+            deleted: false,
+            signature: Vec::new(),
+        }
+    }
+
+    fn build_event_for(member: &GroupTestMember, event: &CalendarEvent) -> Envelope {
+        crate::events::build_event_envelope(&member.ks, "phone", event).unwrap()
+    }
+
+    fn send_event(
+        state: &ApiState,
+        member: &GroupTestMember,
+        method: &str,
+        path: &str,
+        envelope: &Envelope,
+    ) -> Response {
+        let mut req = signed_request(
+            &member.signing,
+            &member.member_pk,
+            method,
+            path,
+            "",
+            now_epoch(),
+        );
+        req.body = envelope.encode_to_vec();
+        handle_request(state, &req)
+    }
+
+    fn list_events(
+        state: &ApiState,
+        member: &GroupTestMember,
+        from: i64,
+        to: i64,
+        include_deleted: bool,
+    ) -> (u16, serde_json::Value) {
+        let query = format!(
+            "from={from}&to={to}{}",
+            if include_deleted { "&include_deleted=1" } else { "" }
+        );
+        let resp = handle_request(state, &signed_get(member, "/events", &query));
+        let value: serde_json::Value =
+            serde_json::from_slice(&resp.body).unwrap_or(serde_json::Value::Null);
+        (resp.status, value)
+    }
+
+    #[test]
+    fn event_routes_match() {
+        assert_eq!(route("/events"), Route::Events);
+        let id = "ab".repeat(16);
+        assert_eq!(
+            route(&format!("/events/{id}")),
+            Route::Event { event_id: id }
+        );
+    }
+
+    #[test]
+    fn event_create_list_update_delete_via_api() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let now = now_epoch();
+        let start = 1_900_000_000i64;
+        let id_hex = hex_encode(&[0xE1u8; 16]);
+
+        // Create via POST /events; the projected record comes
+        // back with the 202.
+        let create = sample_event(0xE1, "Picnic", start, now);
+        let resp = send_event(&state, &a, "POST", "/events", &build_event_for(&a, &create));
+        assert_eq!(resp.status, 202, "create: {}", String::from_utf8_lossy(&resp.body));
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["event"]["title"], "Picnic");
+        assert_eq!(v["event"]["event_id"], id_hex);
+        assert_eq!(v["event"]["created_by"], hex_encode(&a.member_pk));
+
+        // Another household member lists it (household calendar).
+        let (status, list) = list_events(&state, &b, start - 10, start + 10, false);
+        assert_eq!(status, 200);
+        assert_eq!(list["count"], 1, "list: {list}");
+        // Range boundaries: start == from is in, start == to is out.
+        let (_, list) = list_events(&state, &b, start, start + 10, false);
+        assert_eq!(list["count"], 1);
+        let (_, list) = list_events(&state, &b, 0, start, false);
+        assert_eq!(list["count"], 0);
+
+        // Update via PUT /events/:id — the new title wins.
+        let mut update = sample_event(0xE1, "Picnic (moved)", start, now + 10);
+        update.created_at = now;
+        let resp = send_event(
+            &state,
+            &a,
+            "PUT",
+            &format!("/events/{id_hex}"),
+            &build_event_for(&a, &update),
+        );
+        assert_eq!(resp.status, 202, "update: {}", String::from_utf8_lossy(&resp.body));
+        let (_, list) = list_events(&state, &b, start - 10, start + 10, false);
+        assert_eq!(list["events"][0]["title"], "Picnic (moved)");
+        assert_eq!(list["events"][0]["created_at"], now);
+
+        // GET /events/:id returns the held version.
+        let resp = handle_request(&state, &signed_get(&a, &format!("/events/{id_hex}"), ""));
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["title"], "Picnic (moved)");
+
+        // A stranger (not creator, not a recorded parent)
+        // may not update it.
+        let c = group_test_member(&state, "C");
+        let mut hijack = sample_event(0xE1, "Hijacked", start, now + 20);
+        hijack.created_at = now;
+        hijack.created_by = a.member_pk.to_vec();
+        let resp = send_event(
+            &state,
+            &c,
+            "PUT",
+            &format!("/events/{id_hex}"),
+            &build_event_for(&c, &hijack),
+        );
+        assert_eq!(resp.status, 403, "hijack: {}", String::from_utf8_lossy(&resp.body));
+
+        // A stale version from the creator is refused.
+        let mut stale = sample_event(0xE1, "Picnic (old)", start, now + 5);
+        stale.created_at = now;
+        let resp = send_event(
+            &state,
+            &a,
+            "PUT",
+            &format!("/events/{id_hex}"),
+            &build_event_for(&a, &stale),
+        );
+        assert_eq!(resp.status, 403, "stale: {}", String::from_utf8_lossy(&resp.body));
+
+        // A recorded parent may update and delete a child's
+        // event.
+        let child = group_test_member(&state, "Child");
+        let parent = group_test_member(&state, "Parent");
+        {
+            let store = state.store.lock().unwrap();
+            store
+                .parent_link_add(&parent.member_pk, &child.member_pk)
+                .unwrap();
+        }
+        let kid_start = start + 100_000;
+        let kid_id_hex = hex_encode(&[0xE2u8; 16]);
+        let kid = sample_event(0xE2, "Soccer practice", kid_start, now);
+        let resp = send_event(&state, &child, "POST", "/events", &build_event_for(&child, &kid));
+        assert_eq!(resp.status, 202, "kid create: {}", String::from_utf8_lossy(&resp.body));
+        let mut kid_update = sample_event(0xE2, "Soccer practice (field 2)", kid_start, now + 10);
+        kid_update.created_at = now;
+        kid_update.created_by = child.member_pk.to_vec();
+        let resp = send_event(
+            &state,
+            &parent,
+            "PUT",
+            &format!("/events/{kid_id_hex}"),
+            &build_event_for(&parent, &kid_update),
+        );
+        assert_eq!(resp.status, 202, "parent update: {}", String::from_utf8_lossy(&resp.body));
+        let mut kid_tombstone = kid_update.clone();
+        kid_tombstone.updated_at = now + 20;
+        kid_tombstone.deleted = true;
+        let resp = send_event(
+            &state,
+            &parent,
+            "DELETE",
+            &format!("/events/{kid_id_hex}"),
+            &build_event_for(&parent, &kid_tombstone),
+        );
+        assert_eq!(resp.status, 202, "parent delete: {}", String::from_utf8_lossy(&resp.body));
+        let (_, list) = list_events(&state, &a, kid_start - 10, kid_start + 10, false);
+        assert_eq!(list["count"], 0);
+        let (_, list) = list_events(&state, &a, kid_start - 10, kid_start + 10, true);
+        assert_eq!(list["count"], 1);
+        assert_eq!(list["events"][0]["deleted"], true);
+
+        // DELETE without the tombstone envelope is a 400.
+        let req = signed_request(
+            &a.signing,
+            &a.member_pk,
+            "DELETE",
+            &format!("/events/{id_hex}"),
+            "",
+            now_epoch(),
+        );
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 400);
+
+        // The creator deletes their own event.
+        let mut tombstone = update.clone();
+        tombstone.updated_at = now + 30;
+        tombstone.deleted = true;
+        let resp = send_event(
+            &state,
+            &a,
+            "DELETE",
+            &format!("/events/{id_hex}"),
+            &build_event_for(&a, &tombstone),
+        );
+        assert_eq!(resp.status, 202, "delete: {}", String::from_utf8_lossy(&resp.body));
+        let (_, list) = list_events(&state, &b, start - 10, start + 10, false);
+        assert_eq!(list["count"], 0);
+        let (_, list) = list_events(&state, &b, start - 10, start + 10, true);
+        assert_eq!(list["count"], 1);
+        assert_eq!(list["events"][0]["deleted"], true);
+    }
+
+    #[test]
+    fn event_bad_signatures_and_wrong_requester_rejected() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let now = now_epoch();
+        let event = sample_event(0xE4, "Dentist", 1_900_000_000, now);
+        let envelope = build_event_for(&a, &event);
+
+        // Envelope signature stripped: envelope validation
+        // refuses it (400).
+        let mut tampered = envelope.clone();
+        tampered.signature = vec![0u8; 64];
+        let resp = send_event(&state, &a, "POST", "/events", &tampered);
+        assert_eq!(resp.status, 400, "tampered envelope: {}", String::from_utf8_lossy(&resp.body));
+
+        // Record signature corrupted, envelope re-signed so
+        // only the record-level check can catch it (403).
+        let mut record = CalendarEvent::decode(envelope.payload_ciphertext.as_slice()).unwrap();
+        record.signature[0] ^= 0xFF;
+        let mut forged = envelope.clone();
+        forged.payload_ciphertext = record.encode_to_vec();
+        forged.signature = Vec::new();
+        let digest = validation::compute_envelope_signing_digest(&forged).unwrap();
+        let device = device_signing(&a);
+        forged.signature = device.sign(&digest).to_bytes().to_vec();
+        let resp = send_event(&state, &a, "POST", "/events", &forged);
+        assert_eq!(resp.status, 403, "forged record: {}", String::from_utf8_lossy(&resp.body));
+
+        // A's envelope submitted under B's request auth: the
+        // actor is not the requester (403).
+        let resp = send_event(&state, &b, "POST", "/events", &envelope);
+        assert_eq!(resp.status, 403, "wrong requester: {}", String::from_utf8_lossy(&resp.body));
+
+        // None of the attempts stored anything.
+        let (_, list) = list_events(&state, &a, 0, 4_102_444_800, true);
+        assert_eq!(list["count"], 0);
+    }
+
+    #[test]
+    fn event_recurring_returned_for_later_range_via_api() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let now = now_epoch();
+        let start = 1_900_000_000i64;
+        let mut recurring = sample_event(0xE5, "Weekly standup", start, now);
+        recurring.rrule = "FREQ=WEEKLY".to_string();
+        let resp = send_event(&state, &a, "POST", "/events", &build_event_for(&a, &recurring));
+        assert_eq!(resp.status, 202);
+        let one_off = sample_event(0xE6, "One-off", start, now);
+        let resp = send_event(&state, &a, "POST", "/events", &build_event_for(&a, &one_off));
+        assert_eq!(resp.status, 202);
+
+        // A range well after both starts: only the series is
+        // surfaced, RRULE intact.
+        let (_, list) = list_events(&state, &a, start + 100_000, start + 200_000, false);
+        assert_eq!(list["count"], 1, "list: {list}");
+        assert_eq!(list["events"][0]["title"], "Weekly standup");
+        assert_eq!(list["events"][0]["rrule"], "FREQ=WEEKLY");
+        assert_eq!(list["events"][0]["recurring"], true);
+    }
+
+    #[test]
+    fn event_submit_via_content_path() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let now = now_epoch();
+        let event = sample_event(0xE7, "Via content path", 1_900_000_000, now);
+        let envelope = build_event_for(&a, &event);
+        let resp = submit_content(&state, &a, &envelope);
+        assert_eq!(resp.status, 202, "content submit: {}", String::from_utf8_lossy(&resp.body));
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "accepted");
+        // Resubmission is a duplicate, not an error.
+        let resp = submit_content(&state, &a, &envelope);
+        assert_eq!(resp.status, 202);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "duplicate");
+        // B may not submit A's event.
+        let other = sample_event(0xE8, "Not yours", 1_900_000_000, now);
+        let other_env = build_event_for(&a, &other);
+        let resp = submit_content(&state, &b, &other_env);
+        assert_eq!(resp.status, 403);
+        // The accepted event is listed.
+        let (_, list) = list_events(&state, &b, 1_900_000_000 - 10, 1_900_000_000 + 10, false);
+        assert_eq!(list["count"], 1);
+        assert_eq!(list["events"][0]["title"], "Via content path");
+    }
+
+    /// Live proof for Phase C3, against the real node over
+    /// real HTTP: enroll one fresh member (founder-approved
+    /// via the backup card), then run the full event lifecycle
+    /// through the HTTP endpoints — create (POST /events),
+    /// read back in range, update (PUT /events/:id), delete
+    /// (DELETE /events/:id with the tombstone envelope) — and
+    /// confirm the default list is empty while include_deleted
+    /// shows the tombstone. Finally the FOUNDER creates the
+    /// one event that stays on the node for Muse's browser
+    /// check ("C3 proof event — family hike", 2026-11-22
+    /// 16:00 America/Denver, Deer Ridge Trailhead, Draper).
+    ///
+    /// Ignored by default. Run with:
+    /// `cargo test events_live_proof_over_http -- --ignored --nocapture`
+    /// Env: `C3_PROOF_ADDR` (default 127.0.0.1:8000),
+    /// `C3_PROOF_CARD` (default the node1 founder card),
+    /// `C3_PROOF_MANIFEST` (default /tmp/c3_proof_cleanup.txt —
+    /// receives the fresh member pubkey + the proof event ids
+    /// so the operator can remove the proof rows from the
+    /// node DB; the founder's leftover event is NOT in it).
+    #[test]
+    #[ignore = "live proof against the running node (Phase C3)"]
+    fn events_live_proof_over_http() {
+        let addr = std::env::var("C3_PROOF_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8000".to_string());
+        let card_path = std::env::var("C3_PROOF_CARD").unwrap_or_else(|_| {
+            "/home/william/tinywebc-node1/founder-backup-card.txt".to_string()
+        });
+        let manifest_path = std::env::var("C3_PROOF_MANIFEST")
+            .unwrap_or_else(|_| "/tmp/c3_proof_cleanup.txt".to_string());
+
+        let card = std::fs::read_to_string(&card_path).expect("read founder card");
+        let card_field = |label: &str| -> Vec<u8> {
+            let line = card
+                .lines()
+                .find(|l| l.starts_with(label))
+                .unwrap_or_else(|| panic!("card missing {label}"));
+            hex_decode(line.split(':').nth(1).unwrap().trim()).unwrap()
+        };
+        let founder_member: [u8; PUBKEY_SIZE] =
+            card_field("Member pubkey:").try_into().unwrap();
+        let founder_member_seed: [u8; PUBKEY_SIZE] =
+            card_field("Member secret (seed):").try_into().unwrap();
+        let founder_device: [u8; PUBKEY_SIZE] =
+            card_field("Device pubkey:").try_into().unwrap();
+        let founder_device_seed: [u8; PUBKEY_SIZE] =
+            card_field("Device secret (seed):").try_into().unwrap();
+        let founder_member_signing = SigningKey::from_bytes(&founder_member_seed);
+        let founder_device_signing = SigningKey::from_bytes(&founder_device_seed);
+        assert_eq!(founder_member_signing.verifying_key().to_bytes(), founder_member);
+        assert_eq!(founder_device_signing.verifying_key().to_bytes(), founder_device);
+
+        // Enroll one fresh member over real HTTP.
+        let mut ks = MemberKeystore::new();
+        ks.generate_member_key().unwrap();
+        let device_pk = ks.add_device_key("phone").unwrap();
+        let member_pk = ks.member_public_key().unwrap();
+        let now = now_epoch();
+        let cert = crate::identity::issue_device_certificate(&ks, "phone", now, 0).unwrap();
+        let (status, body) = http_request(
+            &addr,
+            "POST",
+            "/enroll/begin",
+            "",
+            &[],
+            json!({
+                "member_pubkey": hex_encode(&member_pk),
+                "device_pubkey": hex_encode(&device_pk),
+                "display_name": "C3 Proof Member",
+                "device_cert": hex_encode(&cert.encode_to_vec()),
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(status, 200, "begin: {}", String::from_utf8_lossy(&body));
+        let begin: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let code = begin["code"].as_str().unwrap().to_string();
+        let cert_hash: [u8; 32] = Sha256::digest(cert.encode_to_vec()).into();
+        let ts = now_epoch();
+        let digest = crate::identity::enrollment_approval_digest(
+            &member_pk, &device_pk, &cert_hash, ts,
+        );
+        let signature = founder_device_signing.sign(&digest).to_bytes();
+        let (status, body) = http_request(
+            &addr,
+            "POST",
+            "/enroll/approve",
+            "",
+            &[],
+            json!({
+                "code": code,
+                "timestamp": ts,
+                "signature": hex_encode(&signature),
+                "approver_member_pubkey": hex_encode(&founder_member),
+                "approver_device_pubkey": hex_encode(&founder_device),
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(status, 200, "approve: {}", String::from_utf8_lossy(&body));
+        let member_secret = ks.member_keystore().get_private_key().unwrap();
+        let member_signing = SigningKey::from_keypair_bytes(&member_secret).unwrap();
+
+        let send = |method: &str,
+                    path: &str,
+                    query: &str,
+                    body: &[u8]|
+         -> (u16, serde_json::Value) {
+            let headers = tw_headers(&member_signing, &member_pk, method, path, query);
+            let (status, raw) = http_request(&addr, method, path, query, &headers, body);
+            let value: serde_json::Value =
+                serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+            (status, value)
+        };
+
+        // Create → read back → update → delete, over HTTP.
+        let start = 1_893_000_000i64; // 2030-01-05, arbitrary future slot
+        let mut event = sample_event(0xD3, "C3 live proof event", start, now_epoch());
+        event.location = "Proof Park".to_string();
+        let envelope = crate::events::build_event_envelope(&ks, "phone", &event).unwrap();
+        let (status, v) = send("POST", "/events", "", &envelope.encode_to_vec());
+        assert_eq!(status, 202, "create: {v}");
+        assert_eq!(v["event"]["title"], "C3 live proof event");
+        let event_id_hex = hex_encode(&event.event_id);
+        println!("proof event created: id={event_id_hex}");
+
+        let query = format!("from={}&to={}", start - 10, start + 10);
+        let (status, v) = send("GET", "/events", &query, &[]);
+        assert_eq!(status, 200);
+        assert_eq!(v["count"], 1, "read back: {v}");
+        assert_eq!(v["events"][0]["location"], "Proof Park");
+
+        event.title = "C3 live proof event (updated)".to_string();
+        event.updated_at = now_epoch() + 1;
+        let envelope = crate::events::build_event_envelope(&ks, "phone", &event).unwrap();
+        let (status, v) = send(
+            "PUT",
+            &format!("/events/{event_id_hex}"),
+            "",
+            &envelope.encode_to_vec(),
+        );
+        assert_eq!(status, 202, "update: {v}");
+        assert_eq!(v["event"]["title"], "C3 live proof event (updated)");
+
+        event.updated_at = now_epoch() + 2;
+        event.deleted = true;
+        let envelope = crate::events::build_event_envelope(&ks, "phone", &event).unwrap();
+        let (status, v) = send(
+            "DELETE",
+            &format!("/events/{event_id_hex}"),
+            "",
+            &envelope.encode_to_vec(),
+        );
+        assert_eq!(status, 202, "delete: {v}");
+        let (status, v) = send("GET", "/events", &query, &[]);
+        assert_eq!(status, 200);
+        assert_eq!(v["count"], 0, "default list after delete: {v}");
+        let query_deleted = format!("{query}&include_deleted=1");
+        let (status, v) = send("GET", "/events", &query_deleted, &[]);
+        assert_eq!(status, 200);
+        assert_eq!(v["count"], 1, "include_deleted after delete: {v}");
+        assert_eq!(v["events"][0]["deleted"], true);
+        println!("proof lifecycle PASS: create/read/update/delete over HTTP");
+
+        // The leftover event, created by the founder: stays on
+        // the node for Muse's browser check.
+        // 2026-11-22T16:00:00 in America/Denver (MST, UTC-7) =
+        // 2026-11-22T23:00:00Z = 1795388400.
+        let leftover = CalendarEvent {
+            event_id: vec![0xC3; 16],
+            title: "C3 proof event — family hike".to_string(),
+            notes: "Left by the Phase C3 live proof for the browser check.".to_string(),
+            location: "Deer Ridge Trailhead, Draper".to_string(),
+            start_unix: 1_795_388_400,
+            end_unix: 1_795_388_400 + 5400,
+            timezone: "America/Denver".to_string(),
+            all_day: false,
+            rrule: String::new(),
+            created_by: founder_member.to_vec(),
+            actor_member_pubkey: Vec::new(),
+            actor_device_pubkey: Vec::new(),
+            created_at: now_epoch(),
+            updated_at: now_epoch(),
+            deleted: false,
+            signature: Vec::new(),
+        };
+        let envelope = crate::events::build_event_envelope_with_keys(
+            &founder_member,
+            &founder_device_signing,
+            &leftover,
+        )
+        .unwrap();
+        let headers = tw_headers(
+            &founder_member_signing,
+            &founder_member,
+            "POST",
+            "/events",
+            "",
+        );
+        let (status, raw) = http_request(
+            &addr,
+            "POST",
+            "/events",
+            "",
+            &headers,
+            &envelope.encode_to_vec(),
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+        assert_eq!(status, 202, "leftover create: {v}");
+        let leftover_id = hex_encode(&leftover.event_id);
+        println!("leftover event for browser check: id={leftover_id} title={:?}", leftover.title);
+
+        // Cleanup manifest: the fresh member + the proof event
+        // (all its versions) — NOT the leftover.
+        let manifest = format!(
+            "member={}\ndevice={}\nproof_event_id={}\nleftover_event_id={}\n",
+            hex_encode(&member_pk),
+            hex_encode(&device_pk),
+            event_id_hex,
+            leftover_id,
+        );
+        std::fs::write(&manifest_path, manifest).unwrap();
+        println!("PROOF PASS — cleanup manifest written to {manifest_path}");
     }
 }

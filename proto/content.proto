@@ -344,6 +344,49 @@ message EventRSVP {
   string comment = 3;
 }
 
+// Calendar event record (Phase C3, DESIGN.md §2.3/§5): ONE
+// message for the whole lifecycle of an event. Create, update
+// and delete are all this same record re-issued with a later
+// updated_at; a node keeps the version with the greatest
+// updated_at per event_id (ties between different payloads are
+// broken by envelope digest, so boxes converge), and a version
+// with deleted = true is the tombstone. The model is
+// iCalendar-shaped — stable UID, DTSTART/DTEND instants + TZID,
+// RRULE string — so a future calendar-sync bridge maps onto it
+// 1:1; events are app-only until then (William's decision).
+// This supersedes the one-shot EventCreate sketch above (no
+// timezone, no recurrence, no versioning).
+//
+// The record is the payload of a CONTENT_CALENDAR_EVENT
+// envelope, carried in the clear (identity/control class: the
+// family box can read its own calendar — a deliberate,
+// reversible choice; encrypting event content under group
+// sessions can come later without changing this record). The
+// signature covers a domain-separated digest ("TWEVENT") of
+// fields 1-15 and is made by the acting member's device key
+// (field 12). The actor (fields 11-12) is who issues THIS
+// version: the creator on create (actor == created_by), and on
+// update/delete either the creator or a recorded parent of the
+// creator. The envelope header sender is the same device key.
+message CalendarEvent {
+  bytes event_id = 1;              // 16 bytes, stable id (iCalendar UID)
+  string title = 2;
+  string notes = 3;                // iCalendar DESCRIPTION
+  string location = 4;             // iCalendar LOCATION (free text)
+  int64 start_unix = 5;            // DTSTART instant, seconds since epoch
+  int64 end_unix = 6;              // DTEND instant, seconds since epoch
+  string timezone = 7;             // IANA TZID, e.g. "America/Denver"
+  bool all_day = 8;                // iCalendar VALUE=DATE form
+  string rrule = 9;                // iCalendar RRULE value; "" = one-off
+  bytes created_by = 10;           // 32 bytes Ed25519 member pubkey
+  bytes actor_member_pubkey = 11;  // 32 bytes: member issuing this version
+  bytes actor_device_pubkey = 12;  // 32 bytes: that member's device (signer)
+  uint64 created_at = 13;          // Seconds since epoch
+  uint64 updated_at = 14;          // Seconds since epoch; the version clock
+  bool deleted = 15;               // Tombstone: this version deletes the event
+  bytes signature = 16;            // 64 bytes Ed25519, by the actor device key
+}
+
 message CommunityPostCreate {
   bytes post_id = 1;
   string title = 2;

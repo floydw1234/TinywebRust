@@ -201,6 +201,25 @@ const PROTO_DEFINITION = `
     uint64 expires_at = 5;
     bytes signature = 6;
   }
+
+  message CalendarEvent {
+    bytes event_id = 1;
+    string title = 2;
+    string notes = 3;
+    string location = 4;
+    int64 start_unix = 5;
+    int64 end_unix = 6;
+    string timezone = 7;
+    bool all_day = 8;
+    string rrule = 9;
+    bytes created_by = 10;
+    bytes actor_member_pubkey = 11;
+    bytes actor_device_pubkey = 12;
+    uint64 created_at = 13;
+    uint64 updated_at = 14;
+    bool deleted = 15;
+    bytes signature = 16;
+  }
 `
 
 interface Types {
@@ -214,6 +233,7 @@ interface Types {
   GroupMessage: protobuf.Type
   GroupKeyShare: protobuf.Type
   ConversationMetadata: protobuf.Type
+  CalendarEvent: protobuf.Type
 }
 
 let cached: Types | null = null
@@ -232,6 +252,7 @@ function types(): Types {
     GroupMessage: root.lookupType('tinyweb.GroupMessage'),
     GroupKeyShare: root.lookupType('tinyweb.GroupKeyShare'),
     ConversationMetadata: root.lookupType('tinyweb.ConversationMetadata'),
+    CalendarEvent: root.lookupType('tinyweb.CalendarEvent'),
   }
   return cached
 }
@@ -717,6 +738,86 @@ export function deserializeRawEnvelope(bytes: Uint8Array): RawEnvelope {
       keyNonce: asBytes(w.key_nonce),
       wrappedKey: asBytes(w.wrapped_key),
     })),
+    signature: asBytes(e.signature),
+  }
+}
+
+// ---- CalendarEvent (content.proto; family calendar, Phase C3) ----
+
+/** CONTENT_CALENDAR_EVENT in envelope.proto. */
+export const CONTENT_CALENDAR_EVENT = 162
+
+/**
+ * One version of a calendar event (see the CalendarEvent message
+ * in content.proto). Create/update/delete are the same record
+ * re-issued with a later updatedAt; deleted = true is the
+ * tombstone. The record is signed by the acting member's device
+ * key over the TWEVENT digest (see utils/events.ts).
+ */
+export interface CalendarEventData {
+  eventId: Uint8Array // 16 bytes
+  title: string
+  notes: string
+  location: string
+  startUnix: number // seconds since epoch
+  endUnix: number // seconds since epoch
+  timezone: string // IANA TZID
+  allDay: boolean
+  rrule: string // '' = one-off
+  createdBy: Uint8Array // member pubkey
+  actorMemberPubkey: Uint8Array
+  actorDevicePubkey: Uint8Array
+  createdAt: number // unix seconds
+  updatedAt: number // unix seconds; the version clock
+  deleted: boolean
+  signature: Uint8Array
+}
+
+export function serializeCalendarEvent(ev: CalendarEventData): Uint8Array {
+  const t = types()
+  const proto = {
+    event_id: ev.eventId,
+    title: ev.title,
+    notes: ev.notes || '',
+    location: ev.location || '',
+    start_unix: ev.startUnix,
+    end_unix: ev.endUnix,
+    timezone: ev.timezone || '',
+    all_day: ev.allDay || false,
+    rrule: ev.rrule || '',
+    created_by: ev.createdBy,
+    actor_member_pubkey: ev.actorMemberPubkey,
+    actor_device_pubkey: ev.actorDevicePubkey,
+    created_at: ev.createdAt,
+    updated_at: ev.updatedAt,
+    deleted: ev.deleted || false,
+    signature: ev.signature,
+  }
+  const err = t.CalendarEvent.verify(proto)
+  if (err) throw new Error(`Invalid CalendarEvent: ${err}`)
+  return new Uint8Array(t.CalendarEvent.encode(t.CalendarEvent.create(proto)).finish())
+}
+
+export function deserializeCalendarEvent(bytes: Uint8Array): CalendarEventData {
+  const t = types()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const e = t.CalendarEvent.decode(bytes) as any
+  return {
+    eventId: asBytes(e.event_id),
+    title: e.title || '',
+    notes: e.notes || '',
+    location: e.location || '',
+    startUnix: Number(e.start_unix || 0),
+    endUnix: Number(e.end_unix || 0),
+    timezone: e.timezone || '',
+    allDay: !!e.all_day,
+    rrule: e.rrule || '',
+    createdBy: asBytes(e.created_by),
+    actorMemberPubkey: asBytes(e.actor_member_pubkey),
+    actorDevicePubkey: asBytes(e.actor_device_pubkey),
+    createdAt: Number(e.created_at || 0),
+    updatedAt: Number(e.updated_at || 0),
+    deleted: !!e.deleted,
     signature: asBytes(e.signature),
   }
 }

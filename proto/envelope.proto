@@ -65,6 +65,13 @@ enum ContentType {
   CONTENT_SHARED_ALBUM_CREATE = 159;
   CONTENT_MEDIA_ADD_TO_ALBUM_REQUEST = 160;
   CONTENT_COLLABORATIVE_PROJECT_CREATE = 161;
+  // Phase C3: the versioned calendar event record (content.proto
+  // CalendarEvent). 155 above is the legacy one-shot EventCreate
+  // sketch; it has no timezone, recurrence or update/delete
+  // versioning, so events take this new value rather than
+  // overloading it (DESIGN.md §2.2: enum values are forever, new
+  // features take new values).
+  CONTENT_CALENDAR_EVENT = 162;
 }
 
 message EnvelopeHeader {
