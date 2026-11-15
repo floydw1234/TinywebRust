@@ -438,7 +438,21 @@ pub struct DeviceEntry {
     pub updated_at: u64,
 }
 
-/// Parental visibility level for a child's group conversations
+/// One row of the `groups` table (Phase C1): a named group
+/// conversation. Membership itself lives in
+/// `conversation_members` (Phase B4); this record carries the
+/// group's name and creator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRecord {
+    /// The conversation id (16 bytes, `sessions::GROUP_ID_SIZE`).
+    pub group_id: Vec<u8>,
+    /// Display name chosen at creation.
+    pub name: String,
+    /// The member who created the group.
+    pub creator_pubkey: [u8; PUBKEY_SIZE],
+    /// Creation time (epoch seconds).
+    pub created_at: u64,
+}
 /// (William's decision, Nov 14, 2026): how much of the child's
 /// group chats a parent who is NOT a conversation member may
 /// see. Stored per child in `visibility_settings`.
@@ -729,6 +743,9 @@ const CREATE_GROUP_KEY_SHARES: &str = "CREATE TABLE IF NOT EXISTS group_key_shar
 const CREATE_PARENT_LINKS: &str = "CREATE TABLE IF NOT EXISTS parent_links ( parent_member_pubkey BLOB NOT NULL, child_member_pubkey BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (parent_member_pubkey, child_member_pubkey));";
 const CREATE_VISIBILITY_SETTINGS: &str = "CREATE TABLE IF NOT EXISTS visibility_settings ( child_member_pubkey BLOB PRIMARY KEY, level TEXT NOT NULL DEFAULT 'none', set_by BLOB NOT NULL, updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));";
 const CREATE_CONVERSATION_MEMBERS: &str = "CREATE TABLE IF NOT EXISTS conversation_members ( group_id BLOB NOT NULL, member_pubkey BLOB NOT NULL, joined_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (group_id, member_pubkey));";
+const CREATE_GROUPS: &str = "CREATE TABLE IF NOT EXISTS groups ( group_id BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '', creator_pubkey BLOB NOT NULL, created_at INTEGER NOT NULL);";
+const CREATE_GROUP_RETIRED_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS group_retired_sessions ( session_id BLOB PRIMARY KEY, group_id BLOB NOT NULL, retired_at INTEGER NOT NULL);";
+const CREATE_MESSAGE_SESSION_RECIPIENTS: &str = "CREATE TABLE IF NOT EXISTS message_session_recipients ( id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, recipient_pubkey BLOB NOT NULL, FOREIGN KEY (message_id) REFERENCES user_messages(id) ON DELETE CASCADE);";
 
 /// Statements of `gossip_store_init`, in C execution order.
 const GOSSIP_SCHEMA: &[&str] = &[
@@ -1372,6 +1389,22 @@ impl Store {
                 "INSERT INTO message_sessions(message_id, session_id, message_index) VALUES (?, ?, ?);",
                 params![message_id, &message.session_id[..], message.message_index as i64],
             )?;
+            // Session messages carry no keywraps, so the full
+            // recipient list (the conversation's members at send
+            // time) is recorded in its own side table; without
+            // it, reconstruction could only recover the primary
+            // recipient and other members would never see the
+            // message in their recent/conversation reads
+            // (Phase C1).
+            for recipient in &header.recipients_pubkey {
+                if recipient.len() != PUBKEY_SIZE {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO message_session_recipients(message_id, recipient_pubkey) VALUES (?, ?);",
+                    params![message_id, &recipient[..]],
+                )?;
+            }
         }
         for wrap in &message.keywraps {
             if wrap.recipient_pubkey.len() != PUBKEY_SIZE {
@@ -1473,6 +1506,25 @@ impl Store {
                 None => (Vec::new(), 0),
             }
         };
+        // A session message's recipient list lives in its side
+        // table (it has no keywraps to recover it from); when
+        // present it is the authoritative header recipient list.
+        if !session_id.is_empty() {
+            let mut stmt = self.conn.prepare(
+                "SELECT recipient_pubkey FROM message_session_recipients WHERE message_id = ? ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![raw.id], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut session_recipients: Vec<Vec<u8>> = Vec::new();
+            for r in rows {
+                let pk = r?;
+                if pk.len() == PUBKEY_SIZE {
+                    session_recipients.push(pk);
+                }
+            }
+            if !session_recipients.is_empty() {
+                recipients = session_recipients;
+            }
+        }
         Ok(Some(Message {
             header: Some(MessageHeader {
                 version: raw.version,
@@ -1502,31 +1554,46 @@ impl Store {
     }
 
     /// `message_store_fetch_recent`: messages the user sent, is the
-    /// primary recipient of, or is a keywrap recipient of.
+    /// primary recipient of, is a keywrap recipient of, or is a
+    /// recorded recipient of (sender-session group messages,
+    /// Phase C1).
     pub fn message_store_fetch_recent(
         &self,
         user_pubkey: &[u8; PUBKEY_SIZE],
         limit: u32,
     ) -> Result<Vec<Message>> {
+        self.message_sessions_init()?;
         let raw = self.query_message_rows(
-            "SELECT id, version, timestamp, sender_pubkey, recipient_pubkey, group_id, payload_nonce, ephemeral_pubkey, encrypted_payload, signature FROM user_messages WHERE sender_pubkey = ? OR recipient_pubkey = ? OR id IN (SELECT message_id FROM message_recipients WHERE recipient_pubkey = ?) ORDER BY timestamp DESC LIMIT ?;",
-            &[&user_pubkey[..], &user_pubkey[..], &user_pubkey[..]],
+            "SELECT id, version, timestamp, sender_pubkey, recipient_pubkey, group_id, payload_nonce, ephemeral_pubkey, encrypted_payload, signature FROM user_messages WHERE sender_pubkey = ? OR recipient_pubkey = ? OR id IN (SELECT message_id FROM message_recipients WHERE recipient_pubkey = ?) OR id IN (SELECT message_id FROM message_session_recipients WHERE recipient_pubkey = ?) ORDER BY timestamp DESC LIMIT ?;",
+            &[
+                &user_pubkey[..],
+                &user_pubkey[..],
+                &user_pubkey[..],
+                &user_pubkey[..],
+            ],
             limit,
         )?;
         self.messages_from_rows(&raw)
     }
 
     /// `message_store_fetch_conversation`, both directions,
-    /// including multi-recipient messages via the junction table.
+    /// including multi-recipient messages via the junction table
+    /// and sender-session group messages via their recipient
+    /// side table (Phase C1).
     pub fn message_store_fetch_conversation(
         &self,
         user1_pubkey: &[u8; PUBKEY_SIZE],
         user2_pubkey: &[u8; PUBKEY_SIZE],
         limit: u32,
     ) -> Result<Vec<Message>> {
+        self.message_sessions_init()?;
         let raw = self.query_message_rows(
-            "SELECT DISTINCT m.id, m.version, m.timestamp, m.sender_pubkey, m.recipient_pubkey, m.group_id, m.payload_nonce, m.ephemeral_pubkey, m.encrypted_payload, m.signature FROM user_messages m LEFT JOIN message_recipients mr ON m.id = mr.message_id WHERE ((m.sender_pubkey = ? AND m.recipient_pubkey = ?) OR (m.sender_pubkey = ? AND m.recipient_pubkey = ?)) OR ((m.sender_pubkey = ? AND mr.recipient_pubkey = ?) OR (m.sender_pubkey = ? AND mr.recipient_pubkey = ?)) ORDER BY m.timestamp DESC LIMIT ?;",
+            "SELECT DISTINCT m.id, m.version, m.timestamp, m.sender_pubkey, m.recipient_pubkey, m.group_id, m.payload_nonce, m.ephemeral_pubkey, m.encrypted_payload, m.signature FROM user_messages m LEFT JOIN message_recipients mr ON m.id = mr.message_id LEFT JOIN message_session_recipients msr ON m.id = msr.message_id WHERE ((m.sender_pubkey = ? AND m.recipient_pubkey = ?) OR (m.sender_pubkey = ? AND m.recipient_pubkey = ?)) OR ((m.sender_pubkey = ? AND mr.recipient_pubkey = ?) OR (m.sender_pubkey = ? AND mr.recipient_pubkey = ?)) OR ((m.sender_pubkey = ? AND msr.recipient_pubkey = ?) OR (m.sender_pubkey = ? AND msr.recipient_pubkey = ?)) ORDER BY m.timestamp DESC LIMIT ?;",
             &[
+                &user1_pubkey[..],
+                &user2_pubkey[..],
+                &user2_pubkey[..],
+                &user1_pubkey[..],
                 &user1_pubkey[..],
                 &user2_pubkey[..],
                 &user2_pubkey[..],
@@ -1549,11 +1616,18 @@ impl Store {
         user_pubkey: &[u8; PUBKEY_SIZE],
         limit: u32,
     ) -> Result<ConversationList> {
+        self.message_sessions_init()?;
         let mut stmt = self.conn.prepare(
-            "SELECT partner, MAX(timestamp) as last_ts FROM (  SELECT * FROM (SELECT recipient_pubkey as partner, timestamp FROM user_messages WHERE sender_pubkey = ? ORDER BY timestamp DESC LIMIT 1000)  UNION ALL  SELECT * FROM (SELECT sender_pubkey as partner, timestamp FROM user_messages WHERE recipient_pubkey = ? ORDER BY timestamp DESC LIMIT 1000)  UNION ALL  SELECT * FROM (SELECT sender_pubkey as partner, timestamp FROM user_messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_pubkey = ?) ORDER BY timestamp DESC LIMIT 1000)) GROUP BY partner ORDER BY last_ts DESC LIMIT ?;",
+            "SELECT partner, MAX(timestamp) as last_ts FROM (  SELECT * FROM (SELECT recipient_pubkey as partner, timestamp FROM user_messages WHERE sender_pubkey = ? ORDER BY timestamp DESC LIMIT 1000)  UNION ALL  SELECT * FROM (SELECT sender_pubkey as partner, timestamp FROM user_messages WHERE recipient_pubkey = ? ORDER BY timestamp DESC LIMIT 1000)  UNION ALL  SELECT * FROM (SELECT sender_pubkey as partner, timestamp FROM user_messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_pubkey = ?) ORDER BY timestamp DESC LIMIT 1000)  UNION ALL  SELECT * FROM (SELECT sender_pubkey as partner, timestamp FROM user_messages WHERE id IN (SELECT message_id FROM message_session_recipients WHERE recipient_pubkey = ?) ORDER BY timestamp DESC LIMIT 1000)) GROUP BY partner ORDER BY last_ts DESC LIMIT ?;",
         )?;
         let rows = stmt.query_map(
-            params![&user_pubkey[..], &user_pubkey[..], &user_pubkey[..], limit as i64],
+            params![
+                &user_pubkey[..],
+                &user_pubkey[..],
+                &user_pubkey[..],
+                &user_pubkey[..],
+                limit as i64
+            ],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -2433,6 +2507,7 @@ impl Store {
     /// [`Store::devices_init`]); also part of `MESSAGE_SCHEMA`.
     pub fn message_sessions_init(&self) -> Result<()> {
         self.conn.execute_batch(CREATE_MESSAGE_SESSIONS)?;
+        self.conn.execute_batch(CREATE_MESSAGE_SESSION_RECIPIENTS)?;
         Ok(())
     }
 
@@ -2792,6 +2867,156 @@ impl Store {
         Ok(out)
     }
 
+    // -- groups (Phase C1, DESIGN.md §5) -------------------------
+
+    /// Create the Phase C1 group tables: the group records
+    /// themselves and the retired-session registry the rotation
+    /// trigger writes. Every group operation calls this first,
+    /// like the other lazy inits.
+    pub fn groups_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_GROUPS)?;
+        self.conn.execute_batch(CREATE_GROUP_RETIRED_SESSIONS)?;
+        Ok(())
+    }
+
+    /// Record a new group. Membership rows are written
+    /// separately via [`Store::conversation_member_add`].
+    pub fn group_create(
+        &self,
+        group_id: &[u8],
+        name: &str,
+        creator_pubkey: &[u8; PUBKEY_SIZE],
+        now: u64,
+    ) -> Result<()> {
+        self.groups_init()?;
+        self.conn.execute(
+            "INSERT INTO groups (group_id, name, creator_pubkey, created_at) VALUES (?, ?, ?, ?)",
+            params![group_id, name, &creator_pubkey[..], now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// One group record, `Ok(None)` when the id is unknown.
+    pub fn group_get(&self, group_id: &[u8]) -> Result<Option<GroupRecord>> {
+        self.groups_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, name, creator_pubkey, created_at FROM groups WHERE group_id = ?",
+        )?;
+        let mut rows = stmt.query(params![group_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(group_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All groups a member belongs to, oldest first.
+    pub fn groups_for_member(
+        &self,
+        member_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<Vec<GroupRecord>> {
+        self.groups_init()?;
+        self.sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT g.group_id, g.name, g.creator_pubkey, g.created_at FROM groups g JOIN conversation_members cm ON cm.group_id = g.group_id WHERE cm.member_pubkey = ? ORDER BY g.created_at ASC, g.group_id ASC",
+        )?;
+        let rows = stmt.query_map(params![&member_pubkey[..]], group_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// The (member, device) pairs that currently hold sender
+    /// ("own") session state for a group — the existing senders
+    /// a membership change forces to rotate.
+    pub fn group_own_senders(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Vec<([u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE])>> {
+        self.sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT sender_member_pubkey, sender_device_pubkey FROM sessions WHERE group_id = ? AND direction = 'own' ORDER BY sender_member_pubkey ASC, sender_device_pubkey ASC",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (member, device) = r?;
+            if member.len() == PUBKEY_SIZE && device.len() == PUBKEY_SIZE {
+                let mut m = [0u8; PUBKEY_SIZE];
+                m.copy_from_slice(&member);
+                let mut d = [0u8; PUBKEY_SIZE];
+                d.copy_from_slice(&device);
+                out.push((m, d));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Retire every sender session the store knows for a group
+    /// (the rotation trigger a membership change fires, Phase
+    /// C1): the session ids are recorded in
+    /// `group_retired_sessions` — the submit path refuses
+    /// further messages under them — and the senders' local
+    /// "own" ratchet rows are deleted, so a sender sharing this
+    /// store cannot encrypt under a retired session either and
+    /// must start a fresh one (whose distribution is computed
+    /// from the new membership). Recipients' "received" rows
+    /// are untouched: history stays readable by those who held
+    /// it, exactly as DESIGN.md §9 prescribes. Returns the
+    /// session ids retired by this call (already-retired ids
+    /// are not returned again).
+    pub fn group_retire_sessions(
+        &self,
+        group_id: &[u8],
+        now: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.groups_init()?;
+        self.sessions_init()?;
+        self.message_sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id FROM sessions WHERE group_id = ?
+             UNION SELECT session_id FROM group_key_shares WHERE group_id = ?
+             UNION SELECT ms.session_id FROM message_sessions ms JOIN user_messages m ON m.id = ms.message_id WHERE m.group_id = ?",
+        )?;
+        let rows = stmt.query_map(params![group_id, group_id, group_id], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut known: Vec<Vec<u8>> = Vec::new();
+        for r in rows {
+            known.push(r?);
+        }
+        let mut retired = Vec::new();
+        for session_id in &known {
+            let changed = self.conn.execute(
+                "INSERT OR IGNORE INTO group_retired_sessions (session_id, group_id, retired_at) VALUES (?, ?, ?)",
+                params![&session_id[..], group_id, now as i64],
+            )?;
+            if changed > 0 {
+                retired.push(session_id.clone());
+            }
+        }
+        self.conn.execute(
+            "DELETE FROM sessions WHERE group_id = ? AND direction = 'own'",
+            params![group_id],
+        )?;
+        Ok(retired)
+    }
+
+    /// Whether a session id has been retired by a group
+    /// membership change (the submit path's rotation check).
+    pub fn group_session_is_retired(&self, session_id: &[u8]) -> Result<bool> {
+        self.groups_init()?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM group_retired_sessions WHERE session_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Register a user directly (founding bootstrap and tests):
     /// an active `users` row for `user_pubkey` under `username`.
     /// A no-op when the pubkey is already registered.
@@ -3133,6 +3358,20 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         next_index: row.get::<_, i64>(7)? as u64,
         created_at: row.get::<_, i64>(8)? as u64,
         updated_at: row.get::<_, i64>(9)? as u64,
+    })
+}
+
+fn group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GroupRecord> {
+    let creator_blob: Vec<u8> = row.get(2)?;
+    let mut creator_pubkey = [0u8; PUBKEY_SIZE];
+    if creator_blob.len() == PUBKEY_SIZE {
+        creator_pubkey.copy_from_slice(&creator_blob);
+    }
+    Ok(GroupRecord {
+        group_id: row.get(0)?,
+        name: row.get(1)?,
+        creator_pubkey,
+        created_at: row.get::<_, i64>(3)? as u64,
     })
 }
 
@@ -4393,6 +4632,124 @@ mod tests {
         assert!(store.conversation_member_remove(&group_id, &child).unwrap());
         assert!(!store.conversation_member_remove(&group_id, &child).unwrap());
         assert_eq!(store.conversation_members(&group_id).unwrap(), vec![parent]);
+    }
+
+    #[test]
+    fn group_records_and_session_retirement() {
+        const NOW: u64 = 1_700_000_000;
+        let mut store = Store::open_in_memory().unwrap();
+        store.init_schema().unwrap();
+        let creator = [0xA1; PUBKEY_SIZE];
+        let member = [0xB2; PUBKEY_SIZE];
+        let group_id = vec![0x6A; 16];
+        let session_id = vec![0x51; 16];
+
+        // No group yet.
+        assert!(store.group_get(&group_id).unwrap().is_none());
+        assert!(store.groups_for_member(&creator).unwrap().is_empty());
+
+        store.group_create(&group_id, "Family", &creator, NOW).unwrap();
+        store
+            .conversation_member_add(&group_id, &creator, NOW)
+            .unwrap();
+        store
+            .conversation_member_add(&group_id, &member, NOW)
+            .unwrap();
+        let record = store.group_get(&group_id).unwrap().unwrap();
+        assert_eq!(record.name, "Family");
+        assert_eq!(record.creator_pubkey, creator);
+        assert_eq!(
+            store.groups_for_member(&member).unwrap(),
+            vec![record.clone()]
+        );
+        assert!(store.groups_for_member(&[0xEE; PUBKEY_SIZE]).unwrap().is_empty());
+
+        // A sender session + a recipient session for the group,
+        // plus a submitted message recorded under the session.
+        store
+            .session_save(
+                &session_id,
+                &creator,
+                &group_id,
+                &creator,
+                &creator,
+                "own",
+                &[7u8; 32],
+                1,
+                NOW,
+            )
+            .unwrap();
+        store
+            .session_save(
+                &session_id,
+                &member,
+                &group_id,
+                &creator,
+                &creator,
+                "received",
+                &[7u8; 32],
+                1,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            store.group_own_senders(&group_id).unwrap(),
+            vec![(creator, creator)]
+        );
+        assert!(!store.group_session_is_retired(&session_id).unwrap());
+
+        // Retirement: the session id is registered, the sender's
+        // own row is gone, the recipient's received row survives.
+        let retired = store.group_retire_sessions(&group_id, NOW + 10).unwrap();
+        assert_eq!(retired, vec![session_id.clone()]);
+        assert!(store.group_session_is_retired(&session_id).unwrap());
+        assert!(store.session_get(&session_id, &creator).unwrap().is_none());
+        assert!(store.session_get(&session_id, &member).unwrap().is_some());
+        // A second retirement retires nothing new.
+        assert!(store
+            .group_retire_sessions(&group_id, NOW + 20)
+            .unwrap()
+            .is_empty());
+
+        // Session recipients round-trip through the message
+        // store: a session message saved with three recipients
+        // reads back with all three (and no keywraps).
+        let msg = Message {
+            header: Some(MessageHeader {
+                version: 1,
+                timestamp: NOW,
+                sender_pubkey: creator.to_vec(),
+                recipients_pubkey: vec![creator.to_vec(), member.to_vec(), vec![0xC3; 32]],
+                group_id: group_id.clone(),
+            }),
+            payload_nonce: vec![1u8; 24],
+            ephemeral_pubkey: creator.to_vec(),
+            payload_ciphertext: vec![9u8; 8],
+            keywraps: Vec::new(),
+            signature: vec![3u8; 64],
+            session_id: session_id.clone(),
+            message_index: 0,
+        };
+        store.message_store_save(&msg, NOW + 1000).unwrap();
+        let recent = store.message_store_fetch_recent(&member, 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0]
+                .header
+                .as_ref()
+                .unwrap()
+                .recipients_pubkey
+                .len(),
+            3
+        );
+        assert_eq!(recent[0].session_id, session_id);
+        // The third recipient finds it too, via the side table.
+        let third = [0xC3; PUBKEY_SIZE];
+        assert_eq!(store.message_store_fetch_recent(&third, 10).unwrap().len(), 1);
+        let conv = store
+            .message_store_fetch_conversation(&member, &creator, 10)
+            .unwrap();
+        assert_eq!(conv.len(), 1);
     }
 
     #[test]

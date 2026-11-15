@@ -39,7 +39,8 @@ use crate::proto::{
     ClientRequest, ConversationList, DeviceCertificate, Envelope, Message, MessageList,
 };
 use crate::store::{
-    PermissionScope, Store, PERMISSION_VIEW_LOCATION, PUBKEY_SIZE,
+    DeviceStatus, GroupRecord, PermissionScope, Store, PERMISSION_VIEW_LOCATION,
+    PUBKEY_SIZE,
 };
 use crate::validation::{
     self, GossipValidationConfig,
@@ -483,6 +484,16 @@ pub enum Route {
     EnrollApprove,
     /// `GET /enroll/status` (Phase B3, DESIGN.md §5)
     EnrollStatus,
+    /// `GET|POST /groups` (Phase C1, DESIGN.md §5)
+    Groups,
+    /// `POST /groups/:id/members` (Phase C1, DESIGN.md §5)
+    GroupMembers { group_id: String },
+    /// `DELETE /groups/:id/members/:pubkey` (Phase C1)
+    GroupMember { group_id: String, member: String },
+    /// `GET /devices` (Phase C1, DESIGN.md §5)
+    Devices,
+    /// `POST /devices/revoke` (Phase C1, DESIGN.md §5)
+    RevokeDevice,
     /// No route matched: C replies 404.
     NotFound,
 }
@@ -505,7 +516,27 @@ pub fn route(path: &str) -> Route {
         "/enroll/begin" => Route::EnrollBegin,
         "/enroll/approve" => Route::EnrollApprove,
         "/enroll/status" => Route::EnrollStatus,
+        "/groups" => Route::Groups,
+        "/devices" => Route::Devices,
+        "/devices/revoke" => Route::RevokeDevice,
         _ => {
+            if let Some(rest) = path.strip_prefix("/groups/") {
+                let parts: Vec<&str> = rest.split('/').collect();
+                match parts.as_slice() {
+                    [id, "members"] if !id.is_empty() => {
+                        return Route::GroupMembers {
+                            group_id: id.to_string(),
+                        };
+                    }
+                    [id, "members", member] if !id.is_empty() && !member.is_empty() => {
+                        return Route::GroupMember {
+                            group_id: id.to_string(),
+                            member: member.to_string(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
             if let Some(rest) = path.strip_prefix("/location/history/") {
                 if !rest.is_empty() && !rest.contains('/') {
                     return Route::LocationHistory {
@@ -530,13 +561,16 @@ pub fn route(path: &str) -> Route {
 fn allowed_methods_for(path: &str) -> &'static str {
     match path {
         "/messages/submit" | "/gossip/message" | "/location/update" | "/enroll/begin"
-        | "/enroll/approve" => "POST, OPTIONS",
+        | "/enroll/approve" | "/devices/revoke" => "POST, OPTIONS",
+        "/groups" => "GET, POST, OPTIONS",
+        _ if path.starts_with("/groups/") => "GET, POST, DELETE, OPTIONS",
         "/gossip/peers"
         | "/health"
         | "/messages/recent"
         | "/messages/conversation"
         | "/messages/conversations"
         | "/users"
+        | "/devices"
         | "/enroll/status" => "GET, OPTIONS",
         _ if path.starts_with("/location/") => "GET, OPTIONS",
         _ => "GET, POST, OPTIONS",
@@ -891,6 +925,27 @@ pub fn handle_request(state: &ApiState, request: &Request) -> Response {
             "GET" => handle_enroll_status(state, request),
             _ => Response::json_error(405, "Method Not Allowed"),
         },
+        Route::Groups => match request.method.as_str() {
+            "POST" => handle_create_group(state, request),
+            "GET" => handle_list_groups(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::GroupMembers { group_id } => match request.method.as_str() {
+            "POST" => handle_add_group_member(state, request, &group_id),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::GroupMember { group_id, member } => match request.method.as_str() {
+            "DELETE" => handle_remove_group_member(state, request, &group_id, &member),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::Devices => match request.method.as_str() {
+            "GET" => handle_list_devices(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::RevokeDevice => match request.method.as_str() {
+            "POST" => handle_revoke_device(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
         Route::NotFound => Response::json_error(404, "Not Found"),
     }
 }
@@ -1042,6 +1097,78 @@ fn handle_submit_message(state: &ApiState, request: &Request) -> Response {
                 return Response::json_error(403, "Recipient not registered");
             }
         }
+    }
+    // Group gates (Phase C1). A message carrying a group id is
+    // a group message: the sender and every header recipient
+    // must be current members of the conversation — so a
+    // removed member is not even addressed by later messages —
+    // and a sender-session message must not ride a session a
+    // membership change has retired: the sender rotates first
+    // (Phase B4), which is what keeps a removed member's
+    // devices from ever receiving the new session's shares and
+    // gets a new member included. Every refusal is logged.
+    if !header.group_id.is_empty() {
+        let store = state.store.lock().unwrap();
+        let members = match store.conversation_members(&header.group_id) {
+            Ok(m) => m,
+            Err(_) => return Response::json_error(500, "Store error"),
+        };
+        if members.is_empty() {
+            eprintln!(
+                "api groups: rejected group message from {}: unknown group {}",
+                hex_encode(&sender),
+                hex_encode(&header.group_id)
+            );
+            return Response::json_error(403, "Unknown group");
+        }
+        if !members.contains(&sender) {
+            eprintln!(
+                "api groups: rejected group message from {}: sender is not a member of group {}",
+                hex_encode(&sender),
+                hex_encode(&header.group_id)
+            );
+            return Response::json_error(403, "Sender is not a group member");
+        }
+        for recipient in &header.recipients_pubkey {
+            let Ok(recipient_key) =
+                <[u8; PUBKEY_SIZE]>::try_from(recipient.as_slice())
+            else {
+                return Response::json_error(403, "Recipient is not a group member");
+            };
+            if !members.contains(&recipient_key) {
+                eprintln!(
+                    "api groups: rejected group message from {}: recipient {} is not a member of group {}",
+                    hex_encode(&sender),
+                    hex_encode(&recipient_key),
+                    hex_encode(&header.group_id)
+                );
+                return Response::json_error(403, "Recipient is not a group member");
+            }
+        }
+        if !msg.session_id.is_empty() {
+            match store.group_session_is_retired(&msg.session_id) {
+                Ok(true) => {
+                    eprintln!(
+                        "api groups: rejected group message from {}: session {} was retired by a membership change in group {}",
+                        hex_encode(&sender),
+                        hex_encode(&msg.session_id),
+                        hex_encode(&header.group_id)
+                    );
+                    return Response::json_error(
+                        403,
+                        "Session retired by a membership change; rotate the session",
+                    );
+                }
+                Ok(false) => {}
+                Err(_) => return Response::json_error(500, "Store error"),
+            }
+        }
+    } else if !msg.session_id.is_empty() {
+        eprintln!(
+            "api groups: rejected session message from {}: session id without a group id",
+            hex_encode(&sender)
+        );
+        return Response::json_error(400, "Session message without a group id");
     }
     // C `message_permissions_check` currently allows all messaging
     // between registered users (checked above), so no further gate.
@@ -1836,6 +1963,566 @@ fn handle_enroll_status(state: &ApiState, request: &Request) -> Response {
             "member_pubkey": hex_encode(&record.member_pubkey),
             "device_pubkey": hex_encode(&record.device_pubkey),
             "expires_at": record.expires_at,
+        })
+        .to_string(),
+    )
+}
+
+// -- groups & devices (Phase C1, DESIGN.md §5) ----------------------------
+
+fn groups_reject(context: &str, reason: &str) {
+    eprintln!("api groups: rejected {context}: {reason}");
+}
+
+fn devices_reject(context: &str, reason: &str) {
+    eprintln!("api devices: rejected {context}: {reason}");
+}
+
+/// The JSON shape one group is reported in (create/list and the
+/// membership-change replies): the record plus its current
+/// member list from `conversation_members`.
+fn group_json(store: &Store, record: &GroupRecord) -> serde_json::Value {
+    let members = store
+        .conversation_members(&record.group_id)
+        .unwrap_or_default();
+    json!({
+        "group_id": hex_encode(&record.group_id),
+        "name": record.name,
+        "creator": hex_encode(&record.creator_pubkey),
+        "created_at": record.created_at,
+        "members": members.iter().map(|m| hex_encode(m)).collect::<Vec<_>>(),
+    })
+}
+
+/// "Enrolled" for group purposes: a registered user with at
+/// least one device on record. Enrollment (Phase B3) writes
+/// both atomically, so a bare `users` row (a pre-enrollment
+/// legacy registration) has no device and cannot take part in
+/// group crypto.
+fn is_enrolled(store: &Store, member: &[u8; PUBKEY_SIZE]) -> bool {
+    store.user_exists(member)
+        && store
+            .device_list(member)
+            .map(|devices| !devices.is_empty())
+            .unwrap_or(false)
+}
+
+/// Fire the Phase B4 rotation trigger for one group after a
+/// membership change. Retiring is the store half (see
+/// [`Store::group_retire_sessions`]): every session the store
+/// knows for the group is registered as retired — the submit
+/// path refuses further messages under it — and senders' local
+/// "own" rows are dropped, so each existing sender must call
+/// the B4 `start_session`/`rotate_session` before sending
+/// again. That fresh session's distribution is computed from
+/// the *new* membership by the B4 machinery itself; here we run
+/// [`crate::sessions::compute_distribution`] for each affected
+/// sender so the change (and the device set it now covers) is
+/// on the log. Returns how many sessions were retired.
+fn trigger_group_rotation(store: &Store, group_id: &[u8], now: u64) -> usize {
+    let senders = store.group_own_senders(group_id).unwrap_or_default();
+    let members = store.conversation_members(group_id).unwrap_or_default();
+    let retired = store
+        .group_retire_sessions(group_id, now)
+        .unwrap_or_default();
+    if !retired.is_empty() {
+        eprintln!(
+            "api groups: membership change in group {} retired {} session(s); senders must rotate",
+            hex_encode(group_id),
+            retired.len()
+        );
+    }
+    for (member, device) in &senders {
+        if !members.contains(member) {
+            continue; // a removed sender does not rotate back in
+        }
+        match crate::sessions::compute_distribution(store, group_id, member, device, now) {
+            Ok(dist) => eprintln!(
+                "api groups: rotation for group {}: sender {} starts a fresh session covering {} device(s), {} metadata parent(s)",
+                hex_encode(group_id),
+                hex_encode(member),
+                dist.devices.len(),
+                dist.metadata_parents.len()
+            ),
+            Err(e) => eprintln!(
+                "api groups: rotation for group {}: distribution for sender {} failed: {e}",
+                hex_encode(group_id),
+                hex_encode(member)
+            ),
+        }
+    }
+    retired.len()
+}
+
+/// `POST /groups` — create a group conversation. Body (JSON):
+/// `name` (optional) and `members` (optional array of member
+/// pubkey hex). The creator is always a member. Only enrolled
+/// members may be added; anyone else is refused and logged.
+fn handle_create_group(state: &ApiState, request: &Request) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let Some(body) = json_body(request) else {
+        groups_reject("create", "body is not valid JSON");
+        return Response::json_error(400, "Invalid JSON body");
+    };
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut members: Vec<[u8; PUBKEY_SIZE]> = vec![requester];
+    if let Some(raw_members) = body.get("members") {
+        let Some(raw_members) = raw_members.as_array() else {
+            groups_reject("create", "members is not an array");
+            return Response::json_error(400, "members must be an array");
+        };
+        for item in raw_members {
+            let Some(hex) = item.as_str() else {
+                groups_reject("create", "member entry is not a string");
+                return Response::json_error(400, "Invalid member pubkey");
+            };
+            let Some(pk) = hex_decode_32(hex) else {
+                groups_reject("create", &format!("invalid member pubkey {hex}"));
+                return Response::json_error(400, "Invalid member pubkey");
+            };
+            if !members.contains(&pk) {
+                members.push(pk);
+            }
+        }
+    }
+    let mut group_id = [0u8; crate::sessions::GROUP_ID_SIZE];
+    if getrandom::getrandom(&mut group_id).is_err() {
+        return Response::json_error(500, "Internal error");
+    }
+    let now = now_epoch();
+    let store = state.store.lock().unwrap();
+    for pk in &members {
+        if *pk != requester && !is_enrolled(&store, pk) {
+            groups_reject(
+                "create",
+                &format!("member {} is not enrolled", hex_encode(pk)),
+            );
+            return Response::json_error(
+                403,
+                &format!("Member not enrolled: {}", hex_encode(pk)),
+            );
+        }
+    }
+    if store
+        .group_create(&group_id, &name, &requester, now)
+        .is_err()
+    {
+        return Response::json_error(500, "Store error");
+    }
+    for pk in &members {
+        if store.conversation_member_add(&group_id, pk, now).is_err() {
+            return Response::json_error(500, "Store error");
+        }
+    }
+    let record = match store.group_get(&group_id) {
+        Ok(Some(record)) => record,
+        _ => return Response::json_error(500, "Store error"),
+    };
+    Response::json(200, group_json(&store, &record).to_string())
+}
+
+/// `GET /groups` — the caller's groups, with member lists.
+fn handle_list_groups(state: &ApiState, request: &Request) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let store = state.store.lock().unwrap();
+    let groups = match store.groups_for_member(&requester) {
+        Ok(g) => g,
+        Err(_) => return Response::json_error(500, "Store error"),
+    };
+    let list: Vec<serde_json::Value> =
+        groups.iter().map(|g| group_json(&store, g)).collect();
+    let count = list.len();
+    Response::json(200, json!({ "groups": list, "count": count }).to_string())
+}
+
+fn parse_group_id(context: &str, group_id_hex: &str) -> Result<Vec<u8>, Response> {
+    match hex_decode(group_id_hex) {
+        Some(id) if id.len() == crate::sessions::GROUP_ID_SIZE => Ok(id),
+        _ => {
+            groups_reject(context, &format!("invalid group id {group_id_hex}"));
+            Err(Response::json_error(400, "Invalid group id"))
+        }
+    }
+}
+
+/// `POST /groups/:id/members` — add a member. The caller must
+/// already be a member; the target must be enrolled. Adding
+/// fires the rotation trigger: existing senders start fresh
+/// sessions whose shares cover the new full device set, and
+/// the new member receives no shares for earlier sessions (so
+/// pre-join messages stay unreadable to them).
+fn handle_add_group_member(
+    state: &ApiState,
+    request: &Request,
+    group_id_hex: &str,
+) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let group_id = match parse_group_id("add member", group_id_hex) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let Some(body) = json_body(request) else {
+        groups_reject("add member", "body is not valid JSON");
+        return Response::json_error(400, "Invalid JSON body");
+    };
+    let Some(target) = json_hex_32(&body, "member_pubkey") else {
+        groups_reject("add member", "missing or invalid member_pubkey");
+        return Response::json_error(400, "Missing or invalid member_pubkey");
+    };
+    let now = now_epoch();
+    let store = state.store.lock().unwrap();
+    let Some(record) = (match store.group_get(&group_id) {
+        Ok(r) => r,
+        Err(_) => return Response::json_error(500, "Store error"),
+    }) else {
+        groups_reject(
+            "add member",
+            &format!("unknown group {}", hex_encode(&group_id)),
+        );
+        return Response::json_error(404, "Group not found");
+    };
+    let members = match store.conversation_members(&group_id) {
+        Ok(m) => m,
+        Err(_) => return Response::json_error(500, "Store error"),
+    };
+    if !members.contains(&requester) {
+        groups_reject(
+            "add member",
+            &format!(
+                "caller {} is not a member of group {}",
+                hex_encode(&requester),
+                hex_encode(&group_id)
+            ),
+        );
+        return Response::json_error(403, "Caller is not a group member");
+    }
+    if members.contains(&target) {
+        let mut out = group_json(&store, &record);
+        out["status"] = json!("already_member");
+        return Response::json(200, out.to_string());
+    }
+    if !is_enrolled(&store, &target) {
+        groups_reject(
+            "add member",
+            &format!("member {} is not enrolled", hex_encode(&target)),
+        );
+        return Response::json_error(
+            403,
+            &format!("Member not enrolled: {}", hex_encode(&target)),
+        );
+    }
+    if store
+        .conversation_member_add(&group_id, &target, now)
+        .is_err()
+    {
+        return Response::json_error(500, "Store error");
+    }
+    let retired = trigger_group_rotation(&store, &group_id, now);
+    let mut out = group_json(&store, &record);
+    out["status"] = json!("added");
+    out["retired_sessions"] = json!(retired);
+    Response::json(200, out.to_string())
+}
+
+/// `DELETE /groups/:id/members/:pubkey` — remove a member
+/// (the caller must be a member; a member may remove
+/// themselves). Removal fires the same rotation trigger, so
+/// the removed member's devices receive no shares for later
+/// sessions and cannot read later messages.
+fn handle_remove_group_member(
+    state: &ApiState,
+    request: &Request,
+    group_id_hex: &str,
+    member_hex: &str,
+) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let group_id = match parse_group_id("remove member", group_id_hex) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let Some(target) = hex_decode_32(member_hex) else {
+        groups_reject(
+            "remove member",
+            &format!("invalid member pubkey {member_hex}"),
+        );
+        return Response::json_error(400, "Invalid member pubkey");
+    };
+    let now = now_epoch();
+    let store = state.store.lock().unwrap();
+    let Some(record) = (match store.group_get(&group_id) {
+        Ok(r) => r,
+        Err(_) => return Response::json_error(500, "Store error"),
+    }) else {
+        groups_reject(
+            "remove member",
+            &format!("unknown group {}", hex_encode(&group_id)),
+        );
+        return Response::json_error(404, "Group not found");
+    };
+    let members = match store.conversation_members(&group_id) {
+        Ok(m) => m,
+        Err(_) => return Response::json_error(500, "Store error"),
+    };
+    if !members.contains(&requester) {
+        groups_reject(
+            "remove member",
+            &format!(
+                "caller {} is not a member of group {}",
+                hex_encode(&requester),
+                hex_encode(&group_id)
+            ),
+        );
+        return Response::json_error(403, "Caller is not a group member");
+    }
+    if !members.contains(&target) {
+        groups_reject(
+            "remove member",
+            &format!(
+                "member {} is not in group {}",
+                hex_encode(&target),
+                hex_encode(&group_id)
+            ),
+        );
+        return Response::json_error(404, "Member not in group");
+    }
+    if store
+        .conversation_member_remove(&group_id, &target)
+        .is_err()
+    {
+        return Response::json_error(500, "Store error");
+    }
+    let retired = trigger_group_rotation(&store, &group_id, now);
+    let mut out = group_json(&store, &record);
+    out["status"] = json!("removed");
+    out["retired_sessions"] = json!(retired);
+    Response::json(200, out.to_string())
+}
+
+/// `GET /devices?member=<pubkey>` — one member's devices
+/// (label, status, issued/expires). The caller must be that
+/// member or a recorded parent of them; anyone else is refused
+/// and logged.
+fn handle_list_devices(state: &ApiState, request: &Request) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let Some(member) = query_pubkey(request, "member") else {
+        devices_reject("list", "missing or invalid member query variable");
+        return Response::json_error(400, "Missing member");
+    };
+    let store = state.store.lock().unwrap();
+    let allowed = requester == member
+        || store
+            .parents_of(&member)
+            .map(|parents| parents.contains(&requester))
+            .unwrap_or(false);
+    if !allowed {
+        devices_reject(
+            "list",
+            &format!(
+                "{} may not list devices of {} (not the member or a recorded parent)",
+                hex_encode(&requester),
+                hex_encode(&member)
+            ),
+        );
+        return Response::json_error(403, "Forbidden");
+    }
+    let devices = match store.device_list(&member) {
+        Ok(d) => d,
+        Err(_) => return Response::json_error(500, "Store error"),
+    };
+    let list: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|d| {
+            json!({
+                "device_pubkey": hex_encode(&d.device_pubkey),
+                "label": d.label,
+                "status": match d.status {
+                    DeviceStatus::Active => "active",
+                    DeviceStatus::Revoked => "revoked",
+                },
+                "issued_at": d.issued_at,
+                "expires_at": d.expires_at,
+                "revoked_at": d.revoked_at,
+            })
+        })
+        .collect();
+    Response::json(
+        200,
+        json!({ "member": hex_encode(&member), "devices": list }).to_string(),
+    )
+}
+
+/// `POST /devices/revoke` — revoke one device. Two
+/// authorizations, per Phase C1: the member themselves (the
+/// request's TWREQUEST signature *is* the member key's), or a
+/// recorded parent of the member signing with their *device
+/// key* over the B2 revocation digest — body fields
+/// `parent_member_pubkey`, `parent_device_pubkey`, `timestamp`
+/// and `signature` (the parent's device key is not a `users`
+/// key, so, exactly as in `/enroll/approve`, the authorization
+/// rides in the body rather than the request headers). The
+/// revocation itself is the B2 store operation; revoked
+/// devices are excluded from future B4 distributions by the
+/// distribution machinery's trust check.
+fn handle_revoke_device(state: &ApiState, request: &Request) -> Response {
+    let Some(body) = json_body(request) else {
+        devices_reject("revoke", "body is not valid JSON");
+        return Response::json_error(400, "Invalid JSON body");
+    };
+    let Some(member) = json_hex_32(&body, "member_pubkey") else {
+        devices_reject("revoke", "missing or invalid member_pubkey");
+        return Response::json_error(400, "Missing or invalid member_pubkey");
+    };
+    let Some(device) = json_hex_32(&body, "device_pubkey") else {
+        devices_reject("revoke", "missing or invalid device_pubkey");
+        return Response::json_error(400, "Missing or invalid device_pubkey");
+    };
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let now = now_epoch();
+
+    if body.get("parent_member_pubkey").is_some()
+        || body.get("parent_device_pubkey").is_some()
+    {
+        // Parent mode: a recorded parent's trusted device key
+        // signs the revocation digest for the child's device.
+        let (Some(parent_member), Some(parent_device)) = (
+            json_hex_32(&body, "parent_member_pubkey"),
+            json_hex_32(&body, "parent_device_pubkey"),
+        ) else {
+            devices_reject("revoke", "incomplete parent authorization");
+            return Response::json_error(400, "Incomplete parent authorization");
+        };
+        let Some(timestamp) = body.get("timestamp").and_then(|v| v.as_u64()) else {
+            devices_reject("revoke", "parent authorization has no timestamp");
+            return Response::json_error(400, "Missing timestamp");
+        };
+        let Some(signature) = body
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .and_then(hex_decode)
+            .filter(|s| s.len() == 64)
+        else {
+            devices_reject("revoke", "parent authorization has no valid signature");
+            return Response::json_error(400, "Missing or invalid signature");
+        };
+        let store = state.store.lock().unwrap();
+        let is_parent = store
+            .parents_of(&member)
+            .map(|parents| parents.contains(&parent_member))
+            .unwrap_or(false);
+        if !is_parent {
+            devices_reject(
+                "revoke",
+                &format!(
+                    "{} is not a recorded parent of {}",
+                    hex_encode(&parent_member),
+                    hex_encode(&member)
+                ),
+            );
+            return Response::json_error(403, "Not a recorded parent of the member");
+        }
+        match store.device_is_trusted(&parent_member, &parent_device, now) {
+            Ok(true) => {}
+            _ => {
+                devices_reject(
+                    "revoke",
+                    &format!(
+                        "parent device {} of {} is not trusted",
+                        hex_encode(&parent_device),
+                        hex_encode(&parent_member)
+                    ),
+                );
+                return Response::json_error(403, "Parent device not trusted");
+            }
+        }
+        if timestamp > now.saturating_add(REQUEST_FUTURE_SKEW)
+            || timestamp < now.saturating_sub(REQUEST_TIMESTAMP_WINDOW)
+        {
+            devices_reject("revoke", "parent authorization timestamp out of window");
+            return Response::json_error(403, "Authorization timestamp out of window");
+        }
+        let digest = crate::identity::device_revocation_digest(
+            &member, &device, timestamp, &reason,
+        );
+        if !validation::verify_signature(&signature, &digest, &parent_device) {
+            devices_reject(
+                "revoke",
+                &format!(
+                    "parent device signature does not verify for member {} device {}",
+                    hex_encode(&member),
+                    hex_encode(&device)
+                ),
+            );
+            return Response::json_error(403, "Invalid parent device signature");
+        }
+    } else {
+        // Member mode: TWREQUEST auth, and the requester must
+        // be the member whose device is being revoked.
+        let requester = match authenticate(state, request) {
+            Ok(k) => k,
+            Err(r) => return r,
+        };
+        if requester != member {
+            devices_reject(
+                "revoke",
+                &format!(
+                    "requester {} is not member {} and presented no parent authorization",
+                    hex_encode(&requester),
+                    hex_encode(&member)
+                ),
+            );
+            return Response::json_error(403, "Forbidden");
+        }
+    }
+
+    let store = state.store.lock().unwrap();
+    match store.device_get(&member, &device) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            devices_reject(
+                "revoke",
+                &format!(
+                    "unknown device {} for member {}",
+                    hex_encode(&device),
+                    hex_encode(&member)
+                ),
+            );
+            return Response::json_error(404, "Device not found");
+        }
+        Err(_) => return Response::json_error(500, "Store error"),
+    }
+    let changed = match store.device_revoke(&member, &device, now) {
+        Ok(c) => c,
+        Err(_) => return Response::json_error(500, "Store error"),
+    };
+    Response::json(
+        200,
+        json!({
+            "status": if changed { "revoked" } else { "already_revoked" },
+            "member_pubkey": hex_encode(&member),
+            "device_pubkey": hex_encode(&device),
         })
         .to_string(),
     )
@@ -2860,5 +3547,1206 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pairing_codes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // -- Phase C1: groups & devices --------------------------------
+
+    use crate::keystore::MemberKeystore;
+    use crate::proto::GroupMessage;
+
+    /// A group-capable test member: a `MemberKeystore` (member
+    /// key + one "phone" device key) enrolled in the state's
+    /// store at the store level (user row + device certificate),
+    /// mirroring `sessions::tests::make_member` but usable
+    /// through the HTTP handlers.
+    struct GroupTestMember {
+        ks: MemberKeystore,
+        member_pk: [u8; PUBKEY_SIZE],
+        device_pk: [u8; PUBKEY_SIZE],
+        signing: SigningKey,
+    }
+
+    fn group_test_member(state: &ApiState, name: &str) -> GroupTestMember {
+        let mut ks = MemberKeystore::new();
+        ks.generate_member_key().unwrap();
+        let device_pk = ks.add_device_key("phone").unwrap();
+        let member_pk = ks.member_public_key().unwrap();
+        let now = now_epoch();
+        let cert =
+            crate::identity::issue_device_certificate(&ks, "phone", now, 0).unwrap();
+        let secret = ks.member_keystore().get_private_key().unwrap();
+        let signing = SigningKey::from_keypair_bytes(&secret).unwrap();
+        {
+            let store = state.store.lock().unwrap();
+            store.user_register(&member_pk, name).unwrap();
+            store.device_add(&cert, now).unwrap();
+        }
+        GroupTestMember {
+            ks,
+            member_pk,
+            device_pk,
+            signing,
+        }
+    }
+
+    fn device_signing(member: &GroupTestMember) -> SigningKey {
+        let secret = member
+            .ks
+            .device_keystore("phone")
+            .unwrap()
+            .get_private_key()
+            .unwrap();
+        SigningKey::from_keypair_bytes(&secret).unwrap()
+    }
+
+    fn signed_json(
+        member: &GroupTestMember,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Request {
+        let mut req = signed_request(
+            &member.signing,
+            &member.member_pk,
+            method,
+            path,
+            "",
+            now_epoch(),
+        );
+        req.body = body.to_string().into_bytes();
+        req
+    }
+
+    fn signed_get(member: &GroupTestMember, path: &str, query: &str) -> Request {
+        signed_request(
+            &member.signing,
+            &member.member_pk,
+            "GET",
+            path,
+            query,
+            now_epoch(),
+        )
+    }
+
+    fn create_group(
+        state: &ApiState,
+        creator: &GroupTestMember,
+        name: &str,
+        others: &[&GroupTestMember],
+    ) -> (u16, serde_json::Value) {
+        let members: Vec<String> =
+            others.iter().map(|m| hex_encode(&m.member_pk)).collect();
+        let resp = handle_request(
+            state,
+            &signed_json(
+                creator,
+                "POST",
+                "/groups",
+                json!({ "name": name, "members": members }),
+            ),
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&resp.body).unwrap_or(serde_json::Value::Null);
+        (resp.status, value)
+    }
+
+    fn list_groups(state: &ApiState, member: &GroupTestMember) -> serde_json::Value {
+        let resp = handle_request(state, &signed_get(member, "/groups", ""));
+        assert_eq!(resp.status, 200);
+        serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    fn submit(state: &ApiState, member: &GroupTestMember, msg: &Message) -> Response {
+        let mut req = signed_request(
+            &member.signing,
+            &member.member_pk,
+            "POST",
+            "/messages/submit",
+            "",
+            now_epoch(),
+        );
+        req.body = msg.encode_to_vec();
+        handle_request(state, &req)
+    }
+
+    fn fetch_recent(state: &ApiState, member: &GroupTestMember) -> Vec<Message> {
+        let query = format!("user={}", hex_encode(&member.member_pk));
+        let resp = handle_request(state, &signed_get(member, "/messages/recent", &query));
+        assert_eq!(resp.status, 200);
+        MessageList::decode(resp.body.as_slice())
+            .unwrap()
+            .messages
+    }
+
+    fn group_plaintext(group_id: &[u8], text: &str) -> Vec<u8> {
+        GroupMessage {
+            text: text.to_string(),
+            group_id: group_id.to_vec(),
+            media_ref: Vec::new(),
+            reply_to_timestamp: 0,
+        }
+        .encode_to_vec()
+    }
+
+    /// Start the sender's B4 session against the shared store
+    /// and have every recipient accept their share (the client
+    /// half of the flow; distribution is computed by the B4
+    /// machinery from the store's current membership).
+    fn start_and_accept(
+        state: &ApiState,
+        sender: &GroupTestMember,
+        group_id: &[u8; 16],
+        recipients: &[&GroupTestMember],
+    ) -> [u8; 16] {
+        let store = state.store.lock().unwrap();
+        let started =
+            crate::sessions::start_session(&store, &sender.ks, "phone", group_id, now_epoch())
+                .unwrap();
+        for recipient in recipients {
+            let envelope = started
+                .shares
+                .iter()
+                .find(|e| {
+                    e.header.as_ref().unwrap().recipients_pubkey
+                        == vec![recipient.device_pk.to_vec()]
+                })
+                .expect("a share envelope for every recipient");
+            crate::sessions::accept_share(
+                &store,
+                envelope,
+                &recipient.ks,
+                "phone",
+                now_epoch(),
+            )
+            .unwrap();
+        }
+        started.session_id
+    }
+
+    fn encrypt_group_msg(
+        state: &ApiState,
+        sender: &GroupTestMember,
+        session_id: &[u8; 16],
+        group_id: &[u8; 16],
+        recipients: &[&GroupTestMember],
+        text: &str,
+    ) -> Message {
+        let store = state.store.lock().unwrap();
+        let recipient_pks: Vec<[u8; PUBKEY_SIZE]> =
+            recipients.iter().map(|m| m.member_pk).collect();
+        crate::sessions::encrypt_session_message(
+            &store,
+            session_id,
+            &sender.ks,
+            "phone",
+            &recipient_pks,
+            &group_plaintext(group_id, text),
+            now_epoch(),
+            now_epoch(),
+        )
+        .unwrap()
+    }
+
+    fn decrypt_text(
+        state: &ApiState,
+        member: &GroupTestMember,
+        msg: &Message,
+    ) -> Result<String, crate::sessions::Error> {
+        let store = state.store.lock().unwrap();
+        let plaintext = crate::sessions::decrypt_session_message(
+            &store,
+            &member.device_pk,
+            msg,
+            now_epoch(),
+        )?;
+        Ok(GroupMessage::decode(plaintext.as_slice()).unwrap().text)
+    }
+
+    fn group_id_of(created: &serde_json::Value) -> ([u8; 16], String) {
+        let hex = created["group_id"].as_str().unwrap().to_string();
+        let bytes: [u8; 16] = hex_decode(&hex).unwrap().try_into().unwrap();
+        (bytes, hex)
+    }
+
+    #[test]
+    fn group_and_device_routes_match() {
+        assert_eq!(route("/groups"), Route::Groups);
+        assert_eq!(route("/devices"), Route::Devices);
+        assert_eq!(route("/devices/revoke"), Route::RevokeDevice);
+        let gid = "ab".repeat(16);
+        assert_eq!(
+            route(&format!("/groups/{gid}/members")),
+            Route::GroupMembers {
+                group_id: gid.clone()
+            }
+        );
+        let member = "cd".repeat(32);
+        assert_eq!(
+            route(&format!("/groups/{gid}/members/{member}")),
+            Route::GroupMember {
+                group_id: gid,
+                member
+            }
+        );
+        assert_eq!(route("/groups/"), Route::NotFound);
+        assert_eq!(route("/groups/ab"), Route::NotFound);
+        assert_eq!(route("/groups/ab/members/"), Route::NotFound);
+    }
+
+    #[test]
+    fn group_create_list_and_membership_rules() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let c = group_test_member(&state, "C");
+        let d = group_test_member(&state, "D"); // enrolled, never added
+
+        let (status, created) = create_group(&state, &a, "Family", &[&b, &c]);
+        assert_eq!(status, 200, "create body: {created}");
+        let group_id = created["group_id"].as_str().unwrap().to_string();
+        assert_eq!(created["members"].as_array().unwrap().len(), 3);
+        assert_eq!(created["creator"], hex_encode(&a.member_pk));
+
+        // Every member lists it; a non-member does not.
+        for m in [&a, &b, &c] {
+            let list = list_groups(&state, m);
+            assert_eq!(list["count"], 1);
+            assert_eq!(list["groups"][0]["group_id"], group_id);
+            assert_eq!(list["groups"][0]["name"], "Family");
+            assert_eq!(list["groups"][0]["members"].as_array().unwrap().len(), 3);
+        }
+        assert_eq!(list_groups(&state, &d)["count"], 0);
+
+        // An unenrolled pubkey cannot be added at create time.
+        let ghost = [0x77; 32];
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &a,
+                "POST",
+                "/groups",
+                json!({ "name": "Nope", "members": [hex_encode(&ghost)] }),
+            ),
+        );
+        assert_eq!(resp.status, 403);
+
+        // A non-member cannot add members to the group.
+        let path = format!("/groups/{group_id}/members");
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &d,
+                "POST",
+                &path,
+                json!({ "member_pubkey": hex_encode(&d.member_pk) }),
+            ),
+        );
+        assert_eq!(resp.status, 403);
+
+        // Unknown group: 404.
+        let bogus = "00".repeat(16);
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &a,
+                "POST",
+                &format!("/groups/{bogus}/members"),
+                json!({ "member_pubkey": hex_encode(&d.member_pk) }),
+            ),
+        );
+        assert_eq!(resp.status, 404);
+
+        // Unauthenticated create is refused.
+        assert_eq!(
+            handle_request(&state, &bare_request("POST", "/groups")).status,
+            401
+        );
+    }
+
+    #[test]
+    fn group_session_messages_end_to_end_via_api() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let c = group_test_member(&state, "C");
+        let d = group_test_member(&state, "D"); // enrolled, not a member
+        let (_, created) = create_group(&state, &a, "Chat", &[&b, &c]);
+        let (group_id, _hex) = group_id_of(&created);
+        let all = [&a, &b, &c];
+
+        // A and B each start a sender session; the other members
+        // accept their shares (B4 machinery, client side).
+        let session_a = start_and_accept(&state, &a, &group_id, &[&b, &c]);
+        let session_b = start_and_accept(&state, &b, &group_id, &[&a, &c]);
+
+        let msg_a = encrypt_group_msg(&state, &a, &session_a, &group_id, &all, "hello from A");
+        let resp = submit(&state, &a, &msg_a);
+        assert_eq!(
+            resp.status, 202,
+            "submit A: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let msg_b = encrypt_group_msg(&state, &b, &session_b, &group_id, &all, "hello from B");
+        assert_eq!(submit(&state, &b, &msg_b).status, 202);
+
+        // Every member reads both messages back through the API,
+        // intact: session fields set, full member recipient list
+        // preserved, and decryptable with their own ratchet state.
+        for reader in [&a, &b, &c] {
+            let recent = fetch_recent(&state, reader);
+            let session_msgs: Vec<&Message> =
+                recent.iter().filter(|m| !m.session_id.is_empty()).collect();
+            assert_eq!(
+                session_msgs.len(),
+                2,
+                "reader {} sees both group messages",
+                hex_encode(&reader.member_pk)
+            );
+            for m in &session_msgs {
+                let header = m.header.as_ref().unwrap();
+                assert_eq!(header.recipients_pubkey.len(), 3);
+                assert_eq!(header.group_id, group_id.to_vec());
+                assert!(m.keywraps.is_empty());
+            }
+        }
+        // Decryption matrix: everyone decrypts the others'
+        // messages (a sender does not re-decrypt its own).
+        assert_eq!(decrypt_text(&state, &b, &msg_a).unwrap(), "hello from A");
+        assert_eq!(decrypt_text(&state, &c, &msg_a).unwrap(), "hello from A");
+        assert_eq!(decrypt_text(&state, &a, &msg_b).unwrap(), "hello from B");
+        assert_eq!(decrypt_text(&state, &c, &msg_b).unwrap(), "hello from B");
+
+        // The pairwise conversation read carries them too.
+        let query = format!(
+            "user={}&with={}",
+            hex_encode(&b.member_pk),
+            hex_encode(&a.member_pk)
+        );
+        let resp = handle_request(&state, &signed_get(&b, "/messages/conversation", &query));
+        assert_eq!(resp.status, 200);
+        let conv = MessageList::decode(resp.body.as_slice()).unwrap();
+        assert!(conv
+            .messages
+            .iter()
+            .any(|m| m.session_id == session_a.to_vec()));
+
+        // Non-member D: the group messages never appear in their
+        // reads, and there is no session state to decrypt with.
+        let recent_d = fetch_recent(&state, &d);
+        assert!(recent_d.iter().all(|m| m.session_id.is_empty()));
+        assert!(decrypt_text(&state, &d, &msg_a).is_err());
+    }
+
+    #[test]
+    fn group_add_member_rotates_sessions() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let c = group_test_member(&state, "C");
+        let (_, created) = create_group(&state, &a, "Rotating", &[&b]);
+        let (group_id, group_id_hex) = group_id_of(&created);
+
+        let session1 = start_and_accept(&state, &a, &group_id, &[&b]);
+        let pair = [&a, &b];
+        let m1 = encrypt_group_msg(&state, &a, &session1, &group_id, &pair, "before C joined");
+        assert_eq!(submit(&state, &a, &m1).status, 202);
+        assert_eq!(decrypt_text(&state, &b, &m1).unwrap(), "before C joined");
+        // A second message under the same session, held back
+        // until after the join.
+        let m1b = encrypt_group_msg(
+            &state,
+            &a,
+            &session1,
+            &group_id,
+            &pair,
+            "still the old session",
+        );
+
+        // C joins through the API.
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &a,
+                "POST",
+                &format!("/groups/{group_id_hex}/members"),
+                json!({ "member_pubkey": hex_encode(&c.member_pk) }),
+            ),
+        );
+        assert_eq!(
+            resp.status, 200,
+            "add body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "added");
+        assert!(v["retired_sessions"].as_u64().unwrap() >= 1);
+        assert_eq!(v["members"].as_array().unwrap().len(), 3);
+
+        // The held-back old-session message is refused at submit:
+        // the membership change retired the session.
+        let resp = submit(&state, &a, &m1b);
+        assert_eq!(
+            resp.status, 403,
+            "old session submit: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+
+        // A rotates: a fresh session whose shares cover B *and* C.
+        let all = [&a, &b, &c];
+        let session2 = start_and_accept(&state, &a, &group_id, &[&b, &c]);
+        assert_ne!(session1, session2);
+        let m2 = encrypt_group_msg(&state, &a, &session2, &group_id, &all, "after C joined");
+        assert_eq!(submit(&state, &a, &m2).status, 202);
+        assert_eq!(decrypt_text(&state, &b, &m2).unwrap(), "after C joined");
+        assert_eq!(decrypt_text(&state, &c, &m2).unwrap(), "after C joined");
+
+        // C never held the first session, so the pre-join message
+        // does not decrypt for them.
+        assert!(decrypt_text(&state, &c, &m1).is_err());
+    }
+
+    #[test]
+    fn group_remove_member_rotates_sessions() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let c = group_test_member(&state, "C");
+        let (_, created) = create_group(&state, &a, "Rotating", &[&b, &c]);
+        let (group_id, group_id_hex) = group_id_of(&created);
+
+        let session1 = start_and_accept(&state, &a, &group_id, &[&b, &c]);
+        let all = [&a, &b, &c];
+        let m1 = encrypt_group_msg(&state, &a, &session1, &group_id, &all, "before removal");
+        assert_eq!(submit(&state, &a, &m1).status, 202);
+        assert_eq!(decrypt_text(&state, &b, &m1).unwrap(), "before removal");
+        assert_eq!(decrypt_text(&state, &c, &m1).unwrap(), "before removal");
+        let m1b = encrypt_group_msg(
+            &state,
+            &a,
+            &session1,
+            &group_id,
+            &all,
+            "still the old session",
+        );
+
+        // Remove C through the API.
+        let path = format!(
+            "/groups/{group_id_hex}/members/{}",
+            hex_encode(&c.member_pk)
+        );
+        let req = signed_request(&a.signing, &a.member_pk, "DELETE", &path, "", now_epoch());
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 200,
+            "remove body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "removed");
+        assert!(v["retired_sessions"].as_u64().unwrap() >= 1);
+        assert_eq!(v["members"].as_array().unwrap().len(), 2);
+        // C no longer lists the group.
+        assert_eq!(list_groups(&state, &c)["count"], 0);
+
+        // The held-back old-session message is refused at submit.
+        assert_eq!(submit(&state, &a, &m1b).status, 403);
+
+        // A rotates: the fresh distribution covers B only — no
+        // share is addressed to C's device.
+        let session2 = {
+            let store = state.store.lock().unwrap();
+            let started = crate::sessions::start_session(
+                &store,
+                &a.ks,
+                "phone",
+                &group_id,
+                now_epoch(),
+            )
+            .unwrap();
+            assert_eq!(started.shares.len(), 1, "only B receives a share");
+            assert_eq!(
+                started.shares[0].header.as_ref().unwrap().recipients_pubkey,
+                vec![b.device_pk.to_vec()]
+            );
+            crate::sessions::accept_share(
+                &store,
+                &started.shares[0],
+                &b.ks,
+                "phone",
+                now_epoch(),
+            )
+            .unwrap();
+            started.session_id
+        };
+        let pair = [&a, &b];
+        let m2 = encrypt_group_msg(&state, &a, &session2, &group_id, &pair, "after removal");
+        assert_eq!(submit(&state, &a, &m2).status, 202);
+        assert_eq!(decrypt_text(&state, &b, &m2).unwrap(), "after removal");
+        // C holds no state for the new session: no decryption.
+        assert!(decrypt_text(&state, &c, &m2).is_err());
+
+        // A member may remove themselves.
+        let path = format!(
+            "/groups/{group_id_hex}/members/{}",
+            hex_encode(&b.member_pk)
+        );
+        let req = signed_request(&b.signing, &b.member_pk, "DELETE", &path, "", now_epoch());
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            list_groups(&state, &a)["groups"][0]["members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn devices_list_permissions() {
+        let state = empty_state();
+        let parent = group_test_member(&state, "Parent");
+        let child = group_test_member(&state, "Child");
+        let stranger = group_test_member(&state, "Stranger");
+        {
+            let store = state.store.lock().unwrap();
+            store
+                .parent_link_add(&parent.member_pk, &child.member_pk)
+                .unwrap();
+        }
+        let query = format!("member={}", hex_encode(&child.member_pk));
+
+        // The member themselves.
+        let resp = handle_request(&state, &signed_get(&child, "/devices", &query));
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["member"], hex_encode(&child.member_pk));
+        assert_eq!(v["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(v["devices"][0]["label"], "phone");
+        assert_eq!(v["devices"][0]["status"], "active");
+        assert_eq!(
+            v["devices"][0]["device_pubkey"],
+            hex_encode(&child.device_pk)
+        );
+
+        // A recorded parent.
+        assert_eq!(
+            handle_request(&state, &signed_get(&parent, "/devices", &query)).status,
+            200
+        );
+        // A stranger is refused.
+        assert_eq!(
+            handle_request(&state, &signed_get(&stranger, "/devices", &query)).status,
+            403
+        );
+        // Missing member variable: 400. Unauthenticated: 401.
+        assert_eq!(
+            handle_request(&state, &signed_get(&child, "/devices", "")).status,
+            400
+        );
+        assert_eq!(
+            handle_request(&state, &bare_request("GET", "/devices")).status,
+            401
+        );
+    }
+
+    #[test]
+    fn devices_revoke_by_member_parent_and_stranger() {
+        let state = empty_state();
+        let parent = group_test_member(&state, "Parent");
+        let child = group_test_member(&state, "Child");
+        let stranger = group_test_member(&state, "Stranger");
+
+        // The child's second device ("tablet"), enrolled at the
+        // store level with a member-signed certificate.
+        let tablet_signing = SigningKey::from_bytes(&[0x55; 32]);
+        let tablet_pk = tablet_signing.verifying_key().to_bytes();
+        {
+            let now = now_epoch();
+            let cert = crate::identity::create_device_certificate(
+                child.ks.member_keystore(),
+                &tablet_pk,
+                "tablet",
+                now,
+                0,
+            )
+            .unwrap();
+            let store = state.store.lock().unwrap();
+            store.device_add(&cert, now).unwrap();
+            store
+                .parent_link_add(&parent.member_pk, &child.member_pk)
+                .unwrap();
+        }
+        let trusted = |pk: &[u8; PUBKEY_SIZE]| {
+            let store = state.store.lock().unwrap();
+            store
+                .device_is_trusted(&child.member_pk, pk, now_epoch())
+                .unwrap()
+        };
+        assert!(trusted(&tablet_pk));
+        assert!(trusted(&child.device_pk));
+
+        // A stranger in member mode (not the member, no parent
+        // authorization): refused, nothing changes.
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &stranger,
+                "POST",
+                "/devices/revoke",
+                json!({
+                    "member_pubkey": hex_encode(&child.member_pk),
+                    "device_pubkey": hex_encode(&tablet_pk),
+                }),
+            ),
+        );
+        assert_eq!(resp.status, 403);
+        assert!(trusted(&tablet_pk));
+
+        // A forged parent claim (the stranger is not a recorded
+        // parent, whatever their device key signs): refused.
+        let ts = now_epoch();
+        let digest = crate::identity::device_revocation_digest(
+            &child.member_pk,
+            &child.device_pk,
+            ts,
+            "",
+        );
+        let forged_sig = device_signing(&stranger).sign(&digest).to_bytes();
+        let mut req = bare_request("POST", "/devices/revoke");
+        req.body = json!({
+            "member_pubkey": hex_encode(&child.member_pk),
+            "device_pubkey": hex_encode(&child.device_pk),
+            "parent_member_pubkey": hex_encode(&stranger.member_pk),
+            "parent_device_pubkey": hex_encode(&stranger.device_pk),
+            "timestamp": ts,
+            "signature": hex_encode(&forged_sig),
+        })
+        .to_string()
+        .into_bytes();
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 403);
+        assert!(trusted(&child.device_pk));
+
+        // The real parent, but a signature over the wrong
+        // timestamp: refused.
+        let wrong_digest = crate::identity::device_revocation_digest(
+            &child.member_pk,
+            &child.device_pk,
+            ts + 5,
+            "",
+        );
+        let wrong_sig = device_signing(&parent).sign(&wrong_digest).to_bytes();
+        let mut req = bare_request("POST", "/devices/revoke");
+        req.body = json!({
+            "member_pubkey": hex_encode(&child.member_pk),
+            "device_pubkey": hex_encode(&child.device_pk),
+            "parent_member_pubkey": hex_encode(&parent.member_pk),
+            "parent_device_pubkey": hex_encode(&parent.device_pk),
+            "timestamp": ts,
+            "signature": hex_encode(&wrong_sig),
+        })
+        .to_string()
+        .into_bytes();
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 403);
+        assert!(trusted(&child.device_pk));
+
+        // Member mode: the child revokes their own tablet with
+        // the member key (the TWREQUEST signature).
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &child,
+                "POST",
+                "/devices/revoke",
+                json!({
+                    "member_pubkey": hex_encode(&child.member_pk),
+                    "device_pubkey": hex_encode(&tablet_pk),
+                }),
+            ),
+        );
+        assert_eq!(
+            resp.status, 200,
+            "member revoke: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "revoked");
+        assert!(!trusted(&tablet_pk));
+        // The audit row remains, marked revoked.
+        {
+            let store = state.store.lock().unwrap();
+            let devices = store.device_list(&child.member_pk).unwrap();
+            let tablet = devices
+                .iter()
+                .find(|d| d.device_pubkey == tablet_pk)
+                .unwrap();
+            assert_eq!(tablet.status, DeviceStatus::Revoked);
+        }
+
+        // Parent mode: the recorded parent revokes the child's
+        // phone with their device key — no TWREQUEST headers
+        // involved, the device signature is the authorization.
+        let ts = now_epoch();
+        let digest = crate::identity::device_revocation_digest(
+            &child.member_pk,
+            &child.device_pk,
+            ts,
+            "lost",
+        );
+        let sig = device_signing(&parent).sign(&digest).to_bytes();
+        let mut req = bare_request("POST", "/devices/revoke");
+        req.body = json!({
+            "member_pubkey": hex_encode(&child.member_pk),
+            "device_pubkey": hex_encode(&child.device_pk),
+            "reason": "lost",
+            "parent_member_pubkey": hex_encode(&parent.member_pk),
+            "parent_device_pubkey": hex_encode(&parent.device_pk),
+            "timestamp": ts,
+            "signature": hex_encode(&sig),
+        })
+        .to_string()
+        .into_bytes();
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 200,
+            "parent revoke: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        assert!(!trusted(&child.device_pk));
+
+        // Unknown device: 404.
+        let resp = handle_request(
+            &state,
+            &signed_json(
+                &child,
+                "POST",
+                "/devices/revoke",
+                json!({
+                    "member_pubkey": hex_encode(&child.member_pk),
+                    "device_pubkey": hex_encode(&[0x99; 32]),
+                }),
+            ),
+        );
+        assert_eq!(resp.status, 404);
+
+        // Both devices revoked: the B4 distribution for a group
+        // containing parent + child now offers the child nothing
+        // (revocation feeds distribution through the trust check
+        // — verified here, not reimplemented).
+        let (_, created) = create_group(&state, &parent, "Family", &[&child]);
+        let (group_id, _hex) = group_id_of(&created);
+        let store = state.store.lock().unwrap();
+        let dist = crate::sessions::compute_distribution(
+            &store,
+            &group_id,
+            &parent.member_pk,
+            &parent.device_pk,
+            now_epoch(),
+        )
+        .unwrap();
+        assert!(
+            dist.devices.is_empty(),
+            "revoked devices receive no shares: {dist:?}"
+        );
+    }
+
+    // -- Phase C1 live proof (ignored: needs the running node) --
+
+    /// Minimal HTTP client for the live proof: one request per
+    /// connection, `Connection: close`, status + body back.
+    fn http_request(
+        addr: &str,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect to node");
+        let target = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let mut req = format!(
+            "{method} {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        let status: u16 = head
+            .split_whitespace()
+            .nth(1)
+            .expect("status line")
+            .parse()
+            .unwrap();
+        let split = head.find("\r\n\r\n").expect("header terminator");
+        (status, raw[split + 4..].to_vec())
+    }
+
+    fn tw_headers(
+        signing: &SigningKey,
+        pubkey: &[u8; PUBKEY_SIZE],
+        method: &str,
+        path: &str,
+        query: &str,
+    ) -> Vec<(String, String)> {
+        let ts = now_epoch();
+        let digest = compute_request_digest(method, path, query, &ts.to_string(), pubkey);
+        let signature = signing.sign(&digest).to_bytes();
+        vec![
+            ("X-User-Pubkey".to_string(), hex_encode(pubkey)),
+            ("X-Signature".to_string(), hex_encode(&signature)),
+            ("X-Timestamp".to_string(), ts.to_string()),
+        ]
+    }
+
+    /// Live proof for Phase C1, against the real node over real
+    /// HTTP with real encryption: enroll three fresh members
+    /// (founder-approved, via the backup card's device key),
+    /// form a group through `POST /groups`, exchange B4 session
+    /// messages through the message endpoints, and read them
+    /// back decrypted on every side. Client-side session state
+    /// lives in a scratch store (what a member's own device
+    /// would hold); enrollment facts are mirrored into it the
+    /// way gossip replication will eventually carry them.
+    ///
+    /// Ignored by default. Run with:
+    /// `cargo test group_live_proof_over_http -- --ignored --nocapture`
+    /// Env: `C1_PROOF_ADDR` (default 127.0.0.1:8000),
+    /// `C1_PROOF_CARD` (default the node1 founder card),
+    /// `C1_PROOF_CLIENT_DB` (default /tmp/c1_proof_client.db),
+    /// `C1_PROOF_MANIFEST` (default /tmp/c1_proof_cleanup.txt —
+    /// receives the fresh member pubkeys + group id so the
+    /// operator can remove the proof rows from the node DB).
+    #[test]
+    #[ignore = "live proof against the running node (Phase C1)"]
+    fn group_live_proof_over_http() {
+        let addr = std::env::var("C1_PROOF_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8000".to_string());
+        let card_path = std::env::var("C1_PROOF_CARD").unwrap_or_else(|_| {
+            "/home/william/tinywebc-node1/founder-backup-card.txt".to_string()
+        });
+        let client_db = std::env::var("C1_PROOF_CLIENT_DB")
+            .unwrap_or_else(|_| "/tmp/c1_proof_client.db".to_string());
+        let manifest_path = std::env::var("C1_PROOF_MANIFEST")
+            .unwrap_or_else(|_| "/tmp/c1_proof_cleanup.txt".to_string());
+
+        // The founder's card: approver identity for enrollment.
+        let card = std::fs::read_to_string(&card_path).expect("read founder card");
+        let card_field = |label: &str| -> Vec<u8> {
+            let line = card
+                .lines()
+                .find(|l| l.starts_with(label))
+                .unwrap_or_else(|| panic!("card missing {label}"));
+            hex_decode(line.split(':').nth(1).unwrap().trim()).unwrap()
+        };
+        let founder_member: [u8; PUBKEY_SIZE] =
+            card_field("Member pubkey:").try_into().unwrap();
+        let founder_device: [u8; PUBKEY_SIZE] =
+            card_field("Device pubkey:").try_into().unwrap();
+        let founder_seed: [u8; PUBKEY_SIZE] =
+            card_field("Device secret (seed):").try_into().unwrap();
+        let founder_device_signing = SigningKey::from_bytes(&founder_seed);
+        assert_eq!(
+            founder_device_signing.verifying_key().to_bytes(),
+            founder_device
+        );
+
+        // Scratch client store (the members' "own devices").
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{client_db}{suffix}"));
+        }
+        let client_store = Store::open(&client_db).unwrap();
+        client_store.init_schema().unwrap();
+
+        // Enroll three fresh members over real HTTP.
+        struct ProofMember {
+            ks: MemberKeystore,
+            member_pk: [u8; PUBKEY_SIZE],
+            device_pk: [u8; PUBKEY_SIZE],
+            signing: SigningKey,
+        }
+        let mut members: Vec<ProofMember> = Vec::new();
+        for name in ["Proof One", "Proof Two", "Proof Three"] {
+            let mut ks = MemberKeystore::new();
+            ks.generate_member_key().unwrap();
+            let device_pk = ks.add_device_key("phone").unwrap();
+            let member_pk = ks.member_public_key().unwrap();
+            let now = now_epoch();
+            let cert =
+                crate::identity::issue_device_certificate(&ks, "phone", now, 0).unwrap();
+            let (status, body) = http_request(
+                &addr,
+                "POST",
+                "/enroll/begin",
+                "",
+                &[],
+                json!({
+                    "member_pubkey": hex_encode(&member_pk),
+                    "device_pubkey": hex_encode(&device_pk),
+                    "display_name": name,
+                    "device_cert": hex_encode(&cert.encode_to_vec()),
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            assert_eq!(status, 200, "begin {name}: {}", String::from_utf8_lossy(&body));
+            let begin: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let code = begin["code"].as_str().unwrap().to_string();
+            let cert_hash: [u8; 32] = Sha256::digest(cert.encode_to_vec()).into();
+            let ts = now_epoch();
+            let digest = crate::identity::enrollment_approval_digest(
+                &member_pk, &device_pk, &cert_hash, ts,
+            );
+            let signature = founder_device_signing.sign(&digest).to_bytes();
+            let (status, body) = http_request(
+                &addr,
+                "POST",
+                "/enroll/approve",
+                "",
+                &[],
+                json!({
+                    "code": code,
+                    "timestamp": ts,
+                    "signature": hex_encode(&signature),
+                    "approver_member_pubkey": hex_encode(&founder_member),
+                    "approver_device_pubkey": hex_encode(&founder_device),
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            assert_eq!(
+                status, 200,
+                "approve {name}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            client_store.user_register(&member_pk, name).unwrap();
+            client_store.device_add(&cert, now).unwrap();
+            let secret = ks.member_keystore().get_private_key().unwrap();
+            let signing = SigningKey::from_keypair_bytes(&secret).unwrap();
+            println!("PROOF enrolled {name}: member={}", hex_encode(&member_pk));
+            members.push(ProofMember {
+                ks,
+                member_pk,
+                device_pk,
+                signing,
+            });
+        }
+
+        // Create the group over HTTP (member One is the creator).
+        let creator = &members[0];
+        let headers = tw_headers(&creator.signing, &creator.member_pk, "POST", "/groups", "");
+        let (status, body) = http_request(
+            &addr,
+            "POST",
+            "/groups",
+            "",
+            &headers,
+            json!({
+                "name": "Proof Group",
+                "members": [
+                    hex_encode(&members[1].member_pk),
+                    hex_encode(&members[2].member_pk)
+                ],
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(status, 200, "create group: {}", String::from_utf8_lossy(&body));
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group_id_hex = created["group_id"].as_str().unwrap().to_string();
+        let group_id: [u8; 16] = hex_decode(&group_id_hex).unwrap().try_into().unwrap();
+        println!("PROOF group created: {group_id_hex}");
+        for m in &members {
+            client_store
+                .conversation_member_add(&group_id, &m.member_pk, now_epoch())
+                .unwrap();
+        }
+        // GET /groups over HTTP shows it to another member.
+        let m1 = &members[1];
+        let headers = tw_headers(&m1.signing, &m1.member_pk, "GET", "/groups", "");
+        let (status, body) = http_request(&addr, "GET", "/groups", "", &headers, &[]);
+        assert_eq!(status, 200);
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["groups"][0]["members"].as_array().unwrap().len(), 3);
+        println!("PROOF GET /groups lists the group with 3 members");
+
+        // Every member starts a sender session; all shares are
+        // accepted by their recipients (client-side B4 flow).
+        let mut session_ids: Vec<[u8; 16]> = Vec::new();
+        let mut all_shares: Vec<Envelope> = Vec::new();
+        for m in &members {
+            let started = crate::sessions::start_session(
+                &client_store,
+                &m.ks,
+                "phone",
+                &group_id,
+                now_epoch(),
+            )
+            .unwrap();
+            session_ids.push(started.session_id);
+            all_shares.extend(started.shares);
+        }
+        assert_eq!(all_shares.len(), 6, "3 senders x 2 recipients");
+        for share in &all_shares {
+            let recipient_device: [u8; PUBKEY_SIZE] = share
+                .header
+                .as_ref()
+                .unwrap()
+                .recipients_pubkey[0]
+                .clone()
+                .try_into()
+                .unwrap();
+            let recipient = members
+                .iter()
+                .find(|m| m.device_pk == recipient_device)
+                .unwrap();
+            crate::sessions::accept_share(
+                &client_store,
+                share,
+                &recipient.ks,
+                "phone",
+                now_epoch(),
+            )
+            .unwrap();
+        }
+        println!("PROOF sessions started and all 6 shares accepted");
+
+        // Each member sends one session message through the API.
+        let recipient_pks: Vec<[u8; PUBKEY_SIZE]> =
+            members.iter().map(|m| m.member_pk).collect();
+        for (i, m) in members.iter().enumerate() {
+            let text = format!("proof message from member {}", i + 1);
+            let msg = crate::sessions::encrypt_session_message(
+                &client_store,
+                &session_ids[i],
+                &m.ks,
+                "phone",
+                &recipient_pks,
+                &group_plaintext(&group_id, &text),
+                now_epoch(),
+                now_epoch(),
+            )
+            .unwrap();
+            let headers =
+                tw_headers(&m.signing, &m.member_pk, "POST", "/messages/submit", "");
+            let (status, body) = http_request(
+                &addr,
+                "POST",
+                "/messages/submit",
+                "",
+                &headers,
+                &msg.encode_to_vec(),
+            );
+            assert_eq!(
+                status, 202,
+                "submit member {}: {}",
+                i + 1,
+                String::from_utf8_lossy(&body)
+            );
+            println!("PROOF member {} submitted '{text}' -> 202", i + 1);
+        }
+
+        // Each member fetches recent over HTTP and decrypts the
+        // other two members' messages.
+        for (i, m) in members.iter().enumerate() {
+            let query = format!("user={}", hex_encode(&m.member_pk));
+            let headers = tw_headers(&m.signing, &m.member_pk, "GET", "/messages/recent", &query);
+            let (status, body) =
+                http_request(&addr, "GET", "/messages/recent", &query, &headers, &[]);
+            assert_eq!(status, 200);
+            let list = MessageList::decode(body.as_slice()).unwrap();
+            let group_msgs: Vec<&Message> = list
+                .messages
+                .iter()
+                .filter(|x| !x.session_id.is_empty())
+                .collect();
+            assert_eq!(group_msgs.len(), 3, "member {} recent", i + 1);
+            let mut texts: Vec<String> = Vec::new();
+            for gm in &group_msgs {
+                if gm.header.as_ref().unwrap().sender_pubkey == m.member_pk.to_vec() {
+                    continue;
+                }
+                let plaintext = crate::sessions::decrypt_session_message(
+                    &client_store,
+                    &m.device_pk,
+                    gm,
+                    now_epoch(),
+                )
+                .unwrap();
+                texts.push(GroupMessage::decode(plaintext.as_slice()).unwrap().text);
+            }
+            texts.sort();
+            let expected: Vec<String> = (1..=3)
+                .filter(|n| *n != i + 1)
+                .map(|n| format!("proof message from member {n}"))
+                .collect();
+            assert_eq!(texts, expected, "member {} decrypted the others", i + 1);
+            println!(
+                "PROOF member {} decrypted both other messages: {texts:?}",
+                i + 1
+            );
+        }
+
+        // Devices over HTTP: self-list works, a fellow group
+        // member (not a parent) is refused, member-mode revoke
+        // works and shows up in the list.
+        let m2 = &members[2];
+        let query = format!("member={}", hex_encode(&m2.member_pk));
+        let headers = tw_headers(&m2.signing, &m2.member_pk, "GET", "/devices", &query);
+        let (status, body) = http_request(&addr, "GET", "/devices", &query, &headers, &[]);
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["devices"][0]["status"], "active");
+        let headers = tw_headers(&m1.signing, &m1.member_pk, "GET", "/devices", &query);
+        let (status, _) = http_request(&addr, "GET", "/devices", &query, &headers, &[]);
+        assert_eq!(status, 403, "non-parent member may not list devices");
+        let headers = tw_headers(&m2.signing, &m2.member_pk, "POST", "/devices/revoke", "");
+        let (status, body) = http_request(
+            &addr,
+            "POST",
+            "/devices/revoke",
+            "",
+            &headers,
+            json!({
+                "member_pubkey": hex_encode(&m2.member_pk),
+                "device_pubkey": hex_encode(&m2.device_pk),
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(status, 200, "revoke: {}", String::from_utf8_lossy(&body));
+        let headers = tw_headers(&m2.signing, &m2.member_pk, "GET", "/devices", &query);
+        let (status, body) = http_request(&addr, "GET", "/devices", &query, &headers, &[]);
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["devices"][0]["status"], "revoked");
+        println!("PROOF devices list/revoke over HTTP verified");
+
+        // Cleanup manifest for the operator: the fresh members
+        // and the proof group to remove from the node DB (the
+        // three household members are untouched).
+        let mut manifest = format!("group_id={group_id_hex}\n");
+        for m in &members {
+            manifest.push_str(&format!(
+                "member={} device={}\n",
+                hex_encode(&m.member_pk),
+                hex_encode(&m.device_pk)
+            ));
+        }
+        std::fs::write(&manifest_path, manifest).unwrap();
+        println!("PROOF PASS — cleanup manifest written to {manifest_path}");
     }
 }
