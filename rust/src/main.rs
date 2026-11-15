@@ -23,6 +23,7 @@ pub mod gossip;
 pub mod identity;
 pub mod keystore;
 pub mod proto;
+pub mod sessions;
 pub mod store;
 pub mod validation;
 

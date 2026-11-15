@@ -29,6 +29,13 @@ message Message {
   bytes payload_ciphertext = 4;                 // Encrypted payload + MAC
   repeated MessageRecipientKeyWrap keywraps = 5;      // Per-recipient encrypted keys (for multi-recipient)
   bytes signature = 6;                         // 64 bytes Ed25519 signature over header + payload
+  bytes session_id = 7;                        // Optional: 16 bytes sender-session id (DESIGN.md §9).
+                                               // Set only for group messages encrypted under a
+                                               // sender session; empty means the legacy
+                                               // per-recipient wrap format above. For session
+                                               // messages keywraps is empty and ephemeral_pubkey
+                                               // carries the sender's device pubkey.
+  uint64 message_index = 8;                    // Sender-session ratchet index (session messages only)
 }
 
 // MessageList contains a list of messages for API responses

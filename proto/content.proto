@@ -92,6 +92,46 @@ message GroupMemberLeave {
   string farewell_message = 2;     // Optional
 }
 
+// Group key share (DESIGN.md §9): one sender-session root key
+// handed to ONE recipient device. This record is the envelope
+// payload of a CONTENT_GROUP_KEY_SHARE envelope, carried in the
+// clear (it holds no key material) and signed by the sender's
+// device key; the session root key itself travels in the
+// envelope's single RecipientKeyWrap, wrapped to the recipient
+// device. The signature covers a domain-separated digest
+// ("TWGROUPSHARE") of fields 1-8, so it also binds the wrapped
+// key (via its hash) to exactly this recipient — a relay cannot
+// swap wraps or retarget the share without invalidating it.
+message GroupKeyShare {
+  bytes group_id = 1;              // 16 bytes conversation id
+  bytes session_id = 2;            // 16 bytes session identifier
+  bytes sender_member_pubkey = 3;  // 32 bytes Ed25519
+  bytes sender_device_pubkey = 4;  // 32 bytes Ed25519
+  bytes recipient_member_pubkey = 5; // 32 bytes Ed25519
+  bytes recipient_device_pubkey = 6; // 32 bytes Ed25519
+  uint64 created_at = 7;           // Seconds since epoch
+  bytes wrapped_key_hash = 8;      // SHA-256 of the envelope's wrapped_key for this recipient
+  bytes signature = 9;             // 64 bytes Ed25519, by the sender device key
+}
+
+// Conversation metadata (parental visibility, middle level):
+// a content-free record addressed to a parent who may see who
+// talked and when, but not what was said. It carries no message
+// text and no key material — only the conversation id, the
+// sender, the conversation's member list, and when the message
+// was sent (plus the session/message index so the parent can
+// correlate records). Travels as an ordinary encrypted envelope
+// payload (CONTENT_CONVERSATION_METADATA) wrapped to the
+// parent's member key.
+message ConversationMetadata {
+  bytes group_id = 1;              // 16 bytes conversation id
+  bytes sender_member_pubkey = 2;  // 32 bytes Ed25519
+  repeated bytes recipient_member_pubkeys = 3; // conversation members, 32 bytes each
+  uint64 message_timestamp = 4;    // Seconds since epoch
+  bytes session_id = 5;            // 16 bytes (correlator only, no key material)
+  uint64 message_index = 6;        // Ratchet index of the message
+}
+
 // --- Safety & Control ---
 message PermissionEdit {
   bytes target_user = 1;           // User whose permissions are changing

@@ -413,6 +413,80 @@ pub fn decrypt_message_payload(message: &Message, keystore: &Keystore) -> Result
     )
 }
 
+// ---------------------------------------------------------------------------
+// Single-key wraps (sender-session key shares, DESIGN.md §9)
+// ---------------------------------------------------------------------------
+
+/// Wrap one specific 32-byte key for one recipient, using the
+/// same `crypto_box` machinery as the payload key wraps above:
+/// a fresh ephemeral X25519 keypair seals `key` to the
+/// recipient's Ed25519 public key (converted to Curve25519).
+/// Returns the ephemeral public key (which travels in the
+/// envelope's `ephemeral_pubkey` field) and the wrap naming the
+/// recipient by their Ed25519 key. Used by the group key share
+/// handout, where the wrapped key is a session root key rather
+/// than a random payload key. No sender keypair is needed —
+/// sealing only uses the ephemeral keypair, exactly as in
+/// [`seal_payload`].
+pub fn wrap_key_for_recipient(
+    recipient_pubkey: &[u8; PUBKEY_SIZE],
+    key: &[u8; SYMMETRIC_KEY_SIZE],
+) -> Result<(Vec<u8>, RecipientKeyWrap)> {
+    let mut ephemeral_secret = Zeroizing::new([0u8; SECRET_SIZE]);
+    fill_random(&mut *ephemeral_secret)?;
+    let ephemeral_key = SecretKey::from_bytes(*ephemeral_secret);
+    let ephemeral_pubkey = ephemeral_key.public_key().to_bytes();
+
+    let curve_pubkey = ed25519_pk_to_curve25519(recipient_pubkey)?;
+    let mut key_nonce = [0u8; NONCE_SIZE];
+    fill_random(&mut key_nonce)?;
+    let wrapped_key = box_easy(&curve_pubkey, &ephemeral_secret, &key_nonce, key)?;
+    Ok((
+        ephemeral_pubkey.to_vec(),
+        RecipientKeyWrap {
+            recipient_pubkey: recipient_pubkey.to_vec(),
+            key_nonce: key_nonce.to_vec(),
+            wrapped_key,
+        },
+    ))
+}
+
+/// Open a wrap produced by [`wrap_key_for_recipient`] with the
+/// recipient keypair in `keystore`, returning the 32-byte key.
+/// Fails with [`Error::NotRecipient`] when the wrap names a
+/// different public key than the loaded keypair's, and
+/// [`Error::Crypto`] when the box does not open (tampered wrap
+/// or wrong keys).
+pub fn unwrap_wrapped_key(
+    ephemeral_pubkey: &[u8],
+    wrap: &RecipientKeyWrap,
+    keystore: &Keystore,
+) -> Result<[u8; SYMMETRIC_KEY_SIZE]> {
+    if !keystore.is_keypair_loaded() {
+        return Err(Error::NotInitialized);
+    }
+    let our_pubkey = keystore.get_public_key()?;
+    if wrap.recipient_pubkey != our_pubkey.as_slice() {
+        return Err(Error::NotRecipient);
+    }
+    let our_secret = keystore.get_encryption_private_key()?;
+    let ephemeral_pubkey: &[u8; PUBKEY_SIZE] = ephemeral_pubkey
+        .try_into()
+        .map_err(|_| invalid("ephemeral_pubkey is not 32 bytes"))?;
+    let key_nonce: &[u8; NONCE_SIZE] = wrap
+        .key_nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("key_nonce is not 24 bytes"))?;
+    if wrap.wrapped_key.len() != ENCRYPTED_KEY_SIZE {
+        return Err(invalid("wrapped_key is not 48 bytes"));
+    }
+    let key = box_open_easy(ephemeral_pubkey, &our_secret, key_nonce, &wrap.wrapped_key)?;
+    key.as_slice()
+        .try_into()
+        .map_err(|_| crypto("unwrapped key is not 32 bytes"))
+}
+
 /// [`encrypt_envelope_payload`] using the module-level keystore
 /// singleton, for call sites shaped like the C code.
 pub fn encrypt_envelope_payload_global(
@@ -713,6 +787,36 @@ mod tests {
         let mut malformed = envelope;
         malformed.payload_ciphertext.truncate(8);
         assert!(decrypt_envelope_payload(&malformed, &recipient).is_err());
+    }
+
+    #[test]
+    fn single_key_wrap_round_trip() {
+        let (recipient, recipient_pk) = loaded_keystore();
+        let (other, _other_pk) = loaded_keystore();
+        let key = [0xA5u8; SYMMETRIC_KEY_SIZE];
+
+        let (ephemeral, wrap) = wrap_key_for_recipient(&recipient_pk, &key).expect("wrap");
+        assert_eq!(ephemeral.len(), PUBKEY_SIZE);
+        assert_eq!(wrap.recipient_pubkey, recipient_pk.to_vec());
+        assert_eq!(wrap.key_nonce.len(), NONCE_SIZE);
+        assert_eq!(wrap.wrapped_key.len(), ENCRYPTED_KEY_SIZE);
+
+        assert_eq!(
+            unwrap_wrapped_key(&ephemeral, &wrap, &recipient).expect("unwrap"),
+            key
+        );
+        // A wrap naming someone else is NotRecipient for us...
+        assert!(matches!(
+            unwrap_wrapped_key(&ephemeral, &wrap, &other),
+            Err(Error::NotRecipient)
+        ));
+        // ...and tampering with the wrapped bytes is a crypto failure.
+        let mut tampered = wrap.clone();
+        tampered.wrapped_key[0] ^= 1;
+        assert!(matches!(
+            unwrap_wrapped_key(&ephemeral, &tampered, &recipient),
+            Err(Error::Crypto(_))
+        ));
     }
 
     #[test]

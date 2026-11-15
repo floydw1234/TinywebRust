@@ -438,6 +438,77 @@ pub struct DeviceEntry {
     pub updated_at: u64,
 }
 
+/// Parental visibility level for a child's group conversations
+/// (William's decision, Nov 14, 2026): how much of the child's
+/// group chats a parent who is NOT a conversation member may
+/// see. Stored per child in `visibility_settings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityLevel {
+    /// The parent receives nothing: no key, no metadata.
+    None,
+    /// The parent receives content-free metadata records
+    /// (conversation id, sender, recipients, timestamp) but
+    /// no session key.
+    RecipientsAndTimes,
+    /// The parent's devices receive session shares like a
+    /// member's and can read the content.
+    Full,
+}
+
+impl VisibilityLevel {
+    /// The stored text form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VisibilityLevel::None => "none",
+            VisibilityLevel::RecipientsAndTimes => "recipients_and_times",
+            VisibilityLevel::Full => "full",
+        }
+    }
+
+    /// Parse a stored level. Anything unrecognized reads as
+    /// [`VisibilityLevel::None`] — visibility fails closed,
+    /// never open.
+    fn from_db(text: &str) -> VisibilityLevel {
+        match text {
+            "recipients_and_times" => VisibilityLevel::RecipientsAndTimes,
+            "full" => VisibilityLevel::Full,
+            _ => VisibilityLevel::None,
+        }
+    }
+}
+
+/// One row of the `sessions` table (Phase B4, DESIGN.md §9):
+/// one device's ratchet state for one sender session. The row
+/// is keyed by (session, owning device) because every device
+/// keeps its own copy of the state: the sender's device holds
+/// the `own` row it encrypts with, and every recipient device
+/// holds a `received` row it decrypts with. `chain_key` is the
+/// current hash-ratchet chain key (the session root key before
+/// the first message); it only ever moves forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// 16-byte session identifier.
+    pub session_id: Vec<u8>,
+    /// The device whose local state this row is.
+    pub owner_device_pubkey: [u8; PUBKEY_SIZE],
+    /// 16-byte conversation (group) identifier.
+    pub group_id: Vec<u8>,
+    /// The member who sends in this session.
+    pub sender_member_pubkey: [u8; PUBKEY_SIZE],
+    /// The device of that member which sends in this session.
+    pub sender_device_pubkey: [u8; PUBKEY_SIZE],
+    /// `own` (we send) or `received` (we read).
+    pub direction: String,
+    /// Current ratchet chain key (32 bytes).
+    pub chain_key: Vec<u8>,
+    /// Index of the next message under the current chain key.
+    pub next_index: u64,
+    /// Row creation time (epoch seconds).
+    pub created_at: u64,
+    /// Last state advance (epoch seconds).
+    pub updated_at: u64,
+}
+
 /// One row of the `pairing_codes` table (Phase B3 enrollment,
 /// DESIGN.md §3.2/§4.2): a pending join request. The table is
 /// server-side only and never gossiped; the code itself is never
@@ -651,6 +722,13 @@ const CREATE_DEVICES: &str = "CREATE TABLE IF NOT EXISTS devices ( member_pubkey
 const CREATE_PAIRING_CODES: &str = "CREATE TABLE IF NOT EXISTS pairing_codes ( code_hash BLOB PRIMARY KEY, member_pubkey BLOB NOT NULL, device_pubkey BLOB NOT NULL, display_name TEXT NOT NULL DEFAULT '', cert BLOB NOT NULL, cert_hash BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);";
 const CREATE_ENROLLMENTS: &str = "CREATE TABLE IF NOT EXISTS enrollments ( id INTEGER PRIMARY KEY AUTOINCREMENT, member_pubkey BLOB NOT NULL, device_pubkey BLOB NOT NULL, cert_hash BLOB NOT NULL, approver_kind TEXT NOT NULL, approver_member_pubkey BLOB, approver_device_pubkey BLOB, recovery_pubkey BLOB, approval_signature BLOB NOT NULL, approval_timestamp INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);";
 const CREATE_RECOVERY_APPROVERS: &str = "CREATE TABLE IF NOT EXISTS recovery_approvers ( recovery_pubkey BLOB PRIMARY KEY, label TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);";
+const CREATE_MESSAGE_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS message_sessions ( message_id INTEGER PRIMARY KEY, session_id BLOB NOT NULL, message_index INTEGER NOT NULL, FOREIGN KEY (message_id) REFERENCES user_messages(id) ON DELETE CASCADE);";
+const CREATE_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS sessions ( session_id BLOB NOT NULL, owner_device_pubkey BLOB NOT NULL, group_id BLOB NOT NULL, sender_member_pubkey BLOB NOT NULL, sender_device_pubkey BLOB NOT NULL, direction TEXT NOT NULL DEFAULT 'received', chain_key BLOB NOT NULL, next_index INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (session_id, owner_device_pubkey));";
+const CREATE_SESSION_SKIPPED_KEYS: &str = "CREATE TABLE IF NOT EXISTS session_skipped_keys ( session_id BLOB NOT NULL, owner_device_pubkey BLOB NOT NULL, message_index INTEGER NOT NULL, message_key BLOB NOT NULL, PRIMARY KEY (session_id, owner_device_pubkey, message_index));";
+const CREATE_GROUP_KEY_SHARES: &str = "CREATE TABLE IF NOT EXISTS group_key_shares ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id BLOB NOT NULL, group_id BLOB NOT NULL, sender_member_pubkey BLOB NOT NULL, sender_device_pubkey BLOB NOT NULL, recipient_member_pubkey BLOB NOT NULL, recipient_device_pubkey BLOB NOT NULL, envelope BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));";
+const CREATE_PARENT_LINKS: &str = "CREATE TABLE IF NOT EXISTS parent_links ( parent_member_pubkey BLOB NOT NULL, child_member_pubkey BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (parent_member_pubkey, child_member_pubkey));";
+const CREATE_VISIBILITY_SETTINGS: &str = "CREATE TABLE IF NOT EXISTS visibility_settings ( child_member_pubkey BLOB PRIMARY KEY, level TEXT NOT NULL DEFAULT 'none', set_by BLOB NOT NULL, updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')));";
+const CREATE_CONVERSATION_MEMBERS: &str = "CREATE TABLE IF NOT EXISTS conversation_members ( group_id BLOB NOT NULL, member_pubkey BLOB NOT NULL, joined_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (group_id, member_pubkey));";
 
 /// Statements of `gossip_store_init`, in C execution order.
 const GOSSIP_SCHEMA: &[&str] = &[
@@ -706,6 +784,7 @@ const MIGRATE_0_TO_1: &[&str] = &[
 const MESSAGE_SCHEMA: &[&str] = &[
     CREATE_USER_MESSAGES,
     CREATE_MESSAGE_RECIPIENTS,
+    CREATE_MESSAGE_SESSIONS,
     CREATE_IDX_MSG_TIMESTAMP,
     CREATE_IDX_MSG_SENDER,
     CREATE_IDX_MSG_RECIPIENT,
@@ -1237,6 +1316,7 @@ impl Store {
     /// individual keywrap insert failures are logged-and-skipped
     /// in C and likewise ignored here.
     pub fn message_store_save(&mut self, message: &Message, expires_at: u64) -> Result<()> {
+        self.message_sessions_init()?;
         let header = message
             .header
             .as_ref()
@@ -1284,6 +1364,15 @@ impl Store {
             ],
         )?;
         let message_id = tx.last_insert_rowid();
+        // Sender-session messages (Phase B4) carry their session
+        // id + ratchet index in a side table, so the frozen
+        // `user_messages` shape does not change.
+        if !message.session_id.is_empty() {
+            tx.execute(
+                "INSERT INTO message_sessions(message_id, session_id, message_index) VALUES (?, ?, ?);",
+                params![message_id, &message.session_id[..], message.message_index as i64],
+            )?;
+        }
         for wrap in &message.keywraps {
             if wrap.recipient_pubkey.len() != PUBKEY_SIZE {
                 continue;
@@ -1368,6 +1457,22 @@ impl Store {
                 wrapped_key: key,
             });
         }
+        // Sender-session fields (Phase B4), when this message
+        // was stored with them.
+        self.message_sessions_init()?;
+        let (session_id, message_index) = {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, message_index FROM message_sessions WHERE message_id = ?",
+            )?;
+            let mut rows = stmt.query(params![raw.id])?;
+            match rows.next()? {
+                Some(row) => (
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                ),
+                None => (Vec::new(), 0),
+            }
+        };
         Ok(Some(Message {
             header: Some(MessageHeader {
                 version: raw.version,
@@ -1381,6 +1486,8 @@ impl Store {
             payload_ciphertext: raw.encrypted_payload.clone(),
             keywraps,
             signature: raw.signature.clone(),
+            session_id,
+            message_index,
         }))
     }
 
@@ -2320,6 +2427,371 @@ impl Store {
         Ok(rows.next()?.is_some())
     }
 
+    // -- sender sessions, shares, visibility (Phase B4, DESIGN.md §9) --
+
+    /// Create the `message_sessions` table (lazy, like
+    /// [`Store::devices_init`]); also part of `MESSAGE_SCHEMA`.
+    pub fn message_sessions_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_MESSAGE_SESSIONS)?;
+        Ok(())
+    }
+
+    /// Create the Phase B4 tables: sessions, skipped keys,
+    /// share audit, parent links, visibility settings and
+    /// conversation members. Every B4 operation calls this
+    /// first, like the C `ensure_initialized`.
+    pub fn sessions_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_SESSIONS)?;
+        self.conn.execute_batch(CREATE_SESSION_SKIPPED_KEYS)?;
+        self.conn.execute_batch(CREATE_GROUP_KEY_SHARES)?;
+        self.conn.execute_batch(CREATE_PARENT_LINKS)?;
+        self.conn.execute_batch(CREATE_VISIBILITY_SETTINGS)?;
+        self.conn.execute_batch(CREATE_CONVERSATION_MEMBERS)?;
+        Ok(())
+    }
+
+    /// Insert or replace one device's ratchet state for a
+    /// session. Saving is how a session is created (with
+    /// `next_index` 0 and the root key as `chain_key`) and how
+    /// every advance is persisted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_save(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+        group_id: &[u8],
+        sender_member_pubkey: &[u8; PUBKEY_SIZE],
+        sender_device_pubkey: &[u8; PUBKEY_SIZE],
+        direction: &str,
+        chain_key: &[u8],
+        next_index: u64,
+        now: u64,
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "INSERT INTO sessions (session_id, owner_device_pubkey, group_id, sender_member_pubkey, sender_device_pubkey, direction, chain_key, next_index, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, owner_device_pubkey) DO UPDATE SET chain_key = excluded.chain_key, next_index = excluded.next_index, updated_at = excluded.updated_at",
+            params![
+                session_id,
+                &owner_device_pubkey[..],
+                group_id,
+                &sender_member_pubkey[..],
+                &sender_device_pubkey[..],
+                direction,
+                chain_key,
+                next_index as i64,
+                now as i64,
+                now as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One device's ratchet state for a session, `Ok(None)`
+    /// when this device holds no state for it (it never
+    /// received a share, or the session is not its own).
+    pub fn session_get(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<Option<SessionRecord>> {
+        self.sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, owner_device_pubkey, group_id, sender_member_pubkey, sender_device_pubkey, direction, chain_key, next_index, created_at, updated_at FROM sessions WHERE session_id = ? AND owner_device_pubkey = ?",
+        )?;
+        let mut rows = stmt.query(params![session_id, &owner_device_pubkey[..]])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(session_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Advance a stored session's ratchet state after a
+    /// message was encrypted or decrypted under it. Returns
+    /// whether a row was updated.
+    pub fn session_update_state(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+        chain_key: &[u8],
+        next_index: u64,
+        now: u64,
+    ) -> Result<bool> {
+        self.sessions_init()?;
+        let changed = self.conn.execute(
+            "UPDATE sessions SET chain_key = ?, next_index = ?, updated_at = ? WHERE session_id = ? AND owner_device_pubkey = ?",
+            params![
+                chain_key,
+                next_index as i64,
+                now as i64,
+                session_id,
+                &owner_device_pubkey[..]
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Cache the derived message key for an index the
+    /// receiver ratchet skipped over, so the message can
+    /// still be decrypted when it arrives out of order.
+    pub fn session_skipped_key_put(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+        message_index: u64,
+        message_key: &[u8],
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO session_skipped_keys (session_id, owner_device_pubkey, message_index, message_key) VALUES (?, ?, ?, ?)",
+            params![
+                session_id,
+                &owner_device_pubkey[..],
+                message_index as i64,
+                message_key
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A cached skipped message key, `Ok(None)` when the
+    /// index was never skipped (or was already consumed).
+    pub fn session_skipped_key_get(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+        message_index: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT message_key FROM session_skipped_keys WHERE session_id = ? AND owner_device_pubkey = ? AND message_index = ?",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id,
+            &owner_device_pubkey[..],
+            message_index as i64
+        ])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a cached skipped key (after it was used, so a
+    /// replayed message cannot be decrypted twice).
+    pub fn session_skipped_key_remove(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+        message_index: u64,
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "DELETE FROM session_skipped_keys WHERE session_id = ? AND owner_device_pubkey = ? AND message_index = ?",
+            params![
+                session_id,
+                &owner_device_pubkey[..],
+                message_index as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// How many skipped keys are cached for one device's
+    /// session state.
+    pub fn session_skipped_key_count(
+        &self,
+        session_id: &[u8],
+        owner_device_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<u64> {
+        self.sessions_init()?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_skipped_keys WHERE session_id = ? AND owner_device_pubkey = ?",
+            params![session_id, &owner_device_pubkey[..]],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Record a group key share envelope in the audit table
+    /// (who shared which session to which device, and the
+    /// exact envelope bytes). Called when a share is built
+    /// (sender side) and when one is accepted (recipient
+    /// side).
+    #[allow(clippy::too_many_arguments)]
+    pub fn share_record_insert(
+        &self,
+        session_id: &[u8],
+        group_id: &[u8],
+        sender_member_pubkey: &[u8; PUBKEY_SIZE],
+        sender_device_pubkey: &[u8; PUBKEY_SIZE],
+        recipient_member_pubkey: &[u8; PUBKEY_SIZE],
+        recipient_device_pubkey: &[u8; PUBKEY_SIZE],
+        envelope_bytes: &[u8],
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "INSERT INTO group_key_shares (session_id, group_id, sender_member_pubkey, sender_device_pubkey, recipient_member_pubkey, recipient_device_pubkey, envelope) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![
+                session_id,
+                group_id,
+                &sender_member_pubkey[..],
+                &sender_device_pubkey[..],
+                &recipient_member_pubkey[..],
+                &recipient_device_pubkey[..],
+                envelope_bytes
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All recorded share envelopes for one session, oldest
+    /// first, as serialized `Envelope` bytes.
+    pub fn shares_for_session(&self, session_id: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.sessions_init()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT envelope FROM group_key_shares WHERE session_id = ? ORDER BY id ASC")?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Record that `parent` is a parent of `child` (the
+    /// parent-of link the visibility rule consults).
+    pub fn parent_link_add(
+        &self,
+        parent_member_pubkey: &[u8; PUBKEY_SIZE],
+        child_member_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "INSERT INTO parent_links (parent_member_pubkey, child_member_pubkey) VALUES (?, ?) ON CONFLICT(parent_member_pubkey, child_member_pubkey) DO NOTHING",
+            params![&parent_member_pubkey[..], &child_member_pubkey[..]],
+        )?;
+        Ok(())
+    }
+
+    /// All recorded parents of a child member.
+    pub fn parents_of(
+        &self,
+        child_member_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<Vec<[u8; PUBKEY_SIZE]>> {
+        self.sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT parent_member_pubkey FROM parent_links WHERE child_member_pubkey = ? ORDER BY parent_member_pubkey ASC",
+        )?;
+        let rows = stmt.query_map(params![&child_member_pubkey[..]], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let v = r?;
+            if v.len() == PUBKEY_SIZE {
+                let mut key = [0u8; PUBKEY_SIZE];
+                key.copy_from_slice(&v);
+                out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set a child's parental-visibility level. `set_by`
+    /// records which parent set it (the caller checks the
+    /// parent-of link; this layer stores the audit fact).
+    pub fn visibility_set(
+        &self,
+        child_member_pubkey: &[u8; PUBKEY_SIZE],
+        level: VisibilityLevel,
+        set_by: &[u8; PUBKEY_SIZE],
+        now: u64,
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "INSERT INTO visibility_settings (child_member_pubkey, level, set_by, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(child_member_pubkey) DO UPDATE SET level = excluded.level, set_by = excluded.set_by, updated_at = excluded.updated_at",
+            params![
+                &child_member_pubkey[..],
+                level.as_str(),
+                &set_by[..],
+                now as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A child's parental-visibility level. Children with no
+    /// recorded setting are [`VisibilityLevel::None`]: no
+    /// visibility until a parent grants some.
+    pub fn visibility_get(
+        &self,
+        child_member_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<VisibilityLevel> {
+        self.sessions_init()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT level FROM visibility_settings WHERE child_member_pubkey = ?")?;
+        let mut rows = stmt.query(params![&child_member_pubkey[..]])?;
+        match rows.next()? {
+            Some(row) => Ok(VisibilityLevel::from_db(&row.get::<_, String>(0)?)),
+            None => Ok(VisibilityLevel::None),
+        }
+    }
+
+    /// Add a member to a conversation's member list (the
+    /// membership the share distribution helper consults).
+    pub fn conversation_member_add(
+        &self,
+        group_id: &[u8],
+        member_pubkey: &[u8; PUBKEY_SIZE],
+        now: u64,
+    ) -> Result<()> {
+        self.sessions_init()?;
+        self.conn.execute(
+            "INSERT INTO conversation_members (group_id, member_pubkey, joined_at) VALUES (?, ?, ?) ON CONFLICT(group_id, member_pubkey) DO NOTHING",
+            params![group_id, &member_pubkey[..], now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a member from a conversation. Returns whether
+    /// a row was removed.
+    pub fn conversation_member_remove(
+        &self,
+        group_id: &[u8],
+        member_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<bool> {
+        self.sessions_init()?;
+        let changed = self.conn.execute(
+            "DELETE FROM conversation_members WHERE group_id = ? AND member_pubkey = ?",
+            params![group_id, &member_pubkey[..]],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// A conversation's members, in join order.
+    pub fn conversation_members(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Vec<[u8; PUBKEY_SIZE]>> {
+        self.sessions_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT member_pubkey FROM conversation_members WHERE group_id = ? ORDER BY joined_at ASC, member_pubkey ASC",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let v = r?;
+            if v.len() == PUBKEY_SIZE {
+                let mut key = [0u8; PUBKEY_SIZE];
+                key.copy_from_slice(&v);
+                out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
     /// Register a user directly (founding bootstrap and tests):
     /// an active `users` row for `user_pubkey` under `username`.
     /// A no-op when the pubkey is already registered.
@@ -2642,6 +3114,28 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceEntry> {
     })
 }
 
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    fn key32(blob: Vec<u8>) -> [u8; PUBKEY_SIZE] {
+        let mut key = [0u8; PUBKEY_SIZE];
+        if blob.len() == PUBKEY_SIZE {
+            key.copy_from_slice(&blob);
+        }
+        key
+    }
+    Ok(SessionRecord {
+        session_id: row.get(0)?,
+        owner_device_pubkey: key32(row.get(1)?),
+        group_id: row.get(2)?,
+        sender_member_pubkey: key32(row.get(3)?),
+        sender_device_pubkey: key32(row.get(4)?),
+        direction: row.get(5)?,
+        chain_key: row.get(6)?,
+        next_index: row.get::<_, i64>(7)? as u64,
+        created_at: row.get::<_, i64>(8)? as u64,
+        updated_at: row.get::<_, i64>(9)? as u64,
+    })
+}
+
 fn peer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GossipPeerInfo> {
     let pubkey_blob: Option<Vec<u8>> = row.get(3)?;
     let mut node_pubkey = [0u8; PUBKEY_SIZE];
@@ -2712,6 +3206,8 @@ mod tests {
                 wrapped_key: vec![0x05; 32],
             }],
             signature: vec![0x06; 64],
+            session_id: Vec::new(),
+            message_index: 0,
         }
     }
 
@@ -3739,6 +4235,198 @@ mod tests {
         // Re-adding is a no-op, not an error.
         store.recovery_approver_add(&key, "backup card", 1_700_000_100).unwrap();
         assert!(store.recovery_approver_is_registered(&key).unwrap());
+    }
+
+    // -- Phase B4: sessions, visibility, membership -----------------
+
+    #[test]
+    fn session_state_round_trip_and_skipped_keys() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let session_id = vec![0x51; 16];
+        let group_id = vec![0x61; 16];
+        let owner = [0x01; 32];
+        let member = [0x02; 32];
+        let device = [0x03; 32];
+
+        assert!(store.session_get(&session_id, &owner).unwrap().is_none());
+        store
+            .session_save(
+                &session_id,
+                &owner,
+                &group_id,
+                &member,
+                &device,
+                "received",
+                &[0xAA; 32],
+                0,
+                NOW,
+            )
+            .unwrap();
+        let rec = store.session_get(&session_id, &owner).unwrap().unwrap();
+        assert_eq!(rec.group_id, group_id);
+        assert_eq!(rec.sender_member_pubkey, member);
+        assert_eq!(rec.sender_device_pubkey, device);
+        assert_eq!(rec.direction, "received");
+        assert_eq!(rec.chain_key, vec![0xAA; 32]);
+        assert_eq!(rec.next_index, 0);
+        // Another device holds no state for this session.
+        assert!(store.session_get(&session_id, &[0x09; 32]).unwrap().is_none());
+
+        // Advancing replaces the chain state, never the identity.
+        assert!(store
+            .session_update_state(&session_id, &owner, &[0xBB; 32], 3, NOW + 5)
+            .unwrap());
+        let rec = store.session_get(&session_id, &owner).unwrap().unwrap();
+        assert_eq!(rec.chain_key, vec![0xBB; 32]);
+        assert_eq!(rec.next_index, 3);
+        assert!(!store
+            .session_update_state(&session_id, &[0x09; 32], &[0xBB; 32], 3, NOW)
+            .unwrap());
+
+        // Skipped keys: put, get, count, consume.
+        assert_eq!(store.session_skipped_key_count(&session_id, &owner).unwrap(), 0);
+        store
+            .session_skipped_key_put(&session_id, &owner, 1, &[0xCC; 32])
+            .unwrap();
+        store
+            .session_skipped_key_put(&session_id, &owner, 2, &[0xDD; 32])
+            .unwrap();
+        assert_eq!(store.session_skipped_key_count(&session_id, &owner).unwrap(), 2);
+        assert_eq!(
+            store.session_skipped_key_get(&session_id, &owner, 1).unwrap(),
+            Some(vec![0xCC; 32])
+        );
+        store.session_skipped_key_remove(&session_id, &owner, 1).unwrap();
+        assert_eq!(
+            store.session_skipped_key_get(&session_id, &owner, 1).unwrap(),
+            None
+        );
+        assert_eq!(store.session_skipped_key_count(&session_id, &owner).unwrap(), 1);
+    }
+
+    #[test]
+    fn session_state_survives_reopen() {
+        const NOW: u64 = 1_700_000_000;
+        let dir = std::env::temp_dir().join(format!(
+            "tinyweb-b4-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.db");
+        let session_id = vec![0x52; 16];
+        let owner = [0x01; 32];
+        {
+            let store = Store::open(&path).unwrap();
+            store.init_schema().unwrap();
+            store
+                .session_save(
+                    &session_id,
+                    &owner,
+                    &[0x62; 16],
+                    &[0x02; 32],
+                    &[0x03; 32],
+                    "own",
+                    &[0xAA; 32],
+                    7,
+                    NOW,
+                )
+                .unwrap();
+            store
+                .session_skipped_key_put(&session_id, &owner, 4, &[0xCC; 32])
+                .unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            store.init_schema().unwrap();
+            let rec = store.session_get(&session_id, &owner).unwrap().unwrap();
+            assert_eq!(rec.direction, "own");
+            assert_eq!(rec.next_index, 7);
+            assert_eq!(
+                store.session_skipped_key_get(&session_id, &owner, 4).unwrap(),
+                Some(vec![0xCC; 32])
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_links_visibility_and_conversation_members() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let parent = [0x0A; 32];
+        let other_parent = [0x0B; 32];
+        let child = [0x0C; 32];
+        let group_id = vec![0x63; 16];
+
+        // No link, no setting: no parents, visibility none.
+        assert!(store.parents_of(&child).unwrap().is_empty());
+        assert_eq!(store.visibility_get(&child).unwrap(), VisibilityLevel::None);
+
+        store.parent_link_add(&parent, &child).unwrap();
+        store.parent_link_add(&other_parent, &child).unwrap();
+        store.parent_link_add(&parent, &child).unwrap(); // idempotent
+        assert_eq!(store.parents_of(&child).unwrap(), vec![parent, other_parent]);
+
+        store
+            .visibility_set(&child, VisibilityLevel::RecipientsAndTimes, &parent, NOW)
+            .unwrap();
+        assert_eq!(
+            store.visibility_get(&child).unwrap(),
+            VisibilityLevel::RecipientsAndTimes
+        );
+        store
+            .visibility_set(&child, VisibilityLevel::Full, &other_parent, NOW + 1)
+            .unwrap();
+        assert_eq!(store.visibility_get(&child).unwrap(), VisibilityLevel::Full);
+
+        // Membership: join order preserved, removal works.
+        assert!(store.conversation_members(&group_id).unwrap().is_empty());
+        store.conversation_member_add(&group_id, &child, NOW).unwrap();
+        store.conversation_member_add(&group_id, &parent, NOW + 1).unwrap();
+        store.conversation_member_add(&group_id, &child, NOW + 2).unwrap(); // no dup
+        assert_eq!(
+            store.conversation_members(&group_id).unwrap(),
+            vec![child, parent]
+        );
+        assert!(store.conversation_member_remove(&group_id, &child).unwrap());
+        assert!(!store.conversation_member_remove(&group_id, &child).unwrap());
+        assert_eq!(store.conversation_members(&group_id).unwrap(), vec![parent]);
+    }
+
+    #[test]
+    fn message_session_fields_round_trip() {
+        let store = test_store();
+        let sender = [0x21; 32];
+        let recipient = [0x22; 32];
+        let mut store = store;
+
+        // A legacy message stores and reads back with no
+        // session fields.
+        let legacy = make_message(&sender, &recipient, 1_700_000_000);
+        store.message_store_save(&legacy, 1_700_100_000).unwrap();
+
+        // A session message keeps its session id + index.
+        let mut session_msg = make_message(&sender, &recipient, 1_700_000_100);
+        session_msg.session_id = vec![0x53; 16];
+        session_msg.message_index = 42;
+        store.message_store_save(&session_msg, 1_700_100_000).unwrap();
+
+        let recent = store
+            .message_store_fetch_recent(&recipient, 10)
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        let by_ts: std::collections::HashMap<u64, &Message> = recent
+            .iter()
+            .map(|m| (m.header.as_ref().unwrap().timestamp, m))
+            .collect();
+        let legacy_back = by_ts[&1_700_000_000];
+        assert!(legacy_back.session_id.is_empty());
+        assert_eq!(legacy_back.message_index, 0);
+        let session_back = by_ts[&1_700_000_100];
+        assert_eq!(session_back.session_id, vec![0x53; 16]);
+        assert_eq!(session_back.message_index, 42);
     }
 }
 

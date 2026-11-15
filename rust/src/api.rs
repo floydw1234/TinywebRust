@@ -2560,6 +2560,8 @@ mod tests {
             payload_ciphertext: b"hello from the new member".to_vec(),
             keywraps: Vec::new(),
             signature: Vec::new(),
+            session_id: Vec::new(),
+            message_index: 0,
         };
         let digest = validation::compute_message_signing_digest(&msg).unwrap();
         msg.signature = newcomer.member.sign(&digest).to_bytes().to_vec();

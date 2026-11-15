@@ -78,6 +78,8 @@ pub const GOSSIP_PORT: u16 = 9000;
 
 /// `CONTENT_LOCATION_UPDATE` (`content.proto`).
 pub const CONTENT_LOCATION_UPDATE: u32 = 33;
+/// `CONTENT_GROUP_KEY_SHARE` (`envelope.proto`, Phase B4).
+pub const CONTENT_GROUP_KEY_SHARE: u32 = 25;
 /// `CONTENT_EMERGENCY_ALERT` (`content.proto`).
 pub const CONTENT_EMERGENCY_ALERT: u32 = 34;
 /// `CONTENT_NODE_REGISTRATION` (`content.proto`).
@@ -264,11 +266,13 @@ pub fn envelope_content_type_name(content_type: u32) -> &'static str {
         22 => "GroupMemberAdd",
         23 => "GroupMemberRemove",
         24 => "GroupMemberLeave",
+        25 => "GroupKeyShare",
         30 => "PermissionEdit",
         31 => "ParentalControl",
         32 => "ContentFilter",
         33 => "LocationUpdate",
         34 => "EmergencyAlert",
+        35 => "ConversationMetadata",
         40 => "NodeRegistration",
         41 => "SystemConfig",
         50 => "AccessRequest",
@@ -1011,6 +1015,19 @@ impl IngestPipeline {
             .ok_or_else(|| Error::Unauthorized)?;
         self.check_whitelisted(&header.sender_pubkey)?;
 
+        // 2b. Group key shares (Phase B4, DESIGN.md §9) get
+        // their content-level verification before anything is
+        // stored or forwarded: the share signature must
+        // verify, and both the sending device and the
+        // recipient device must be enrolled and currently
+        // trusted. A share that fails is rejected here — the
+        // outer wrapper logs the reason — and never stored.
+        if header.content_type == CONTENT_GROUP_KEY_SHARE {
+            let store = self.store.lock().unwrap();
+            crate::sessions::verify_share_envelope(&store, envelope, now_epoch())
+                .map_err(|e| Error::Validation(format!("group key share rejected: {e}")))?;
+        }
+
         // 3. Deduplication: SHA-256 of the serialized envelope.
         let digest = store::location_store_compute_digest_envelope(envelope);
         let expires_at = validation::gossip_validation_expiration(envelope, &self.config);
@@ -1469,6 +1486,92 @@ mod tests {
         let pipeline = service.attach_ingest(store.clone(), test_config(), None);
         let source: SocketAddr = "127.0.0.1:59996".parse().unwrap();
         pipeline.ingest_envelope(&envelope, Some(source)).unwrap();
+        assert_eq!(stored_envelope_count(&store), 1);
+    }
+
+    /// Phase B4 (DESIGN.md §9): a valid group key share from
+    /// an enrolled device to an enrolled device passes ingest
+    /// and is stored; the same share with a stripped share
+    /// signature (envelope re-signed, so only the share
+    /// signature is wrong) is rejected as a validation failure
+    /// and nothing more is stored.
+    #[test]
+    fn group_key_share_ingest_verifies_share_signature_and_enrollment() {
+        use crate::keystore::MemberKeystore;
+        use crate::proto::GroupKeyShare;
+        use prost::Message as _;
+
+        let store = test_store();
+        let now = now_epoch();
+        let group_id: [u8; 16] = [0x6B; 16];
+
+        // Two enrolled members with devices, in one conversation.
+        let make_member = |store: &Store| {
+            let mut ks = MemberKeystore::new();
+            ks.generate_member_key().unwrap();
+            let device_pk = ks.add_device_key("phone").unwrap();
+            let cert = crate::identity::issue_device_certificate(&ks, "phone", now, 0).unwrap();
+            store.device_add(&cert, now).unwrap();
+            let member_pk = ks.member_public_key().unwrap();
+            store.conversation_member_add(&group_id, &member_pk, now).unwrap();
+            (ks, member_pk, device_pk)
+        };
+        let (a_ks, _a_member, a_device) = {
+            let guard = store.lock().unwrap();
+            make_member(&guard)
+        };
+        let (_b_ks, _b_member, b_device) = {
+            let guard = store.lock().unwrap();
+            make_member(&guard)
+        };
+
+        // A starts a session; the share for B is the test input.
+        let share_envelope = {
+            let guard = store.lock().unwrap();
+            let started =
+                crate::sessions::start_session(&guard, &a_ks, "phone", &group_id, now).unwrap();
+            assert_eq!(started.shares.len(), 1);
+            started.shares.into_iter().next().unwrap()
+        };
+        assert_eq!(
+            share_envelope.header.as_ref().unwrap().recipients_pubkey,
+            vec![b_device.to_vec()]
+        );
+
+        // The gossip trust check keys on the envelope sender —
+        // the sender device.
+        trust_sender(&store, &a_device);
+        let mut service = GossipService::new(0, None, None);
+        let pipeline = service.attach_ingest(store.clone(), test_config(), None);
+        let source: SocketAddr = "127.0.0.1:59995".parse().unwrap();
+
+        pipeline.ingest_envelope(&share_envelope, Some(source)).unwrap();
+        assert_eq!(stored_envelope_count(&store), 1);
+
+        // Strip the share signature and re-sign the envelope
+        // with the sender device key: the envelope is valid,
+        // the share is not, and ingest must refuse it.
+        let mut share =
+            GroupKeyShare::decode(share_envelope.payload_ciphertext.as_slice()).unwrap();
+        share.signature = vec![0u8; 64];
+        let mut tampered = share_envelope.clone();
+        tampered.payload_ciphertext = share.encode_to_vec();
+        let digest = validation::compute_envelope_signing_digest(&tampered).unwrap();
+        let secret = a_ks
+            .device_keystore("phone")
+            .unwrap()
+            .get_private_key()
+            .unwrap();
+        let signing = SigningKey::from_keypair_bytes(&secret).unwrap();
+        tampered.signature = signing.sign(&digest).to_bytes().to_vec();
+
+        let err = pipeline
+            .ingest_envelope(&tampered, Some(source))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Validation(_)),
+            "expected Validation, got {err}"
+        );
         assert_eq!(stored_envelope_count(&store), 1);
     }
 }
