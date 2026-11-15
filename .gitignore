@@ -1,0 +1,5 @@
+rust/target/
+webui/node_modules/
+webui/dist/
+*.local
+.env.local
