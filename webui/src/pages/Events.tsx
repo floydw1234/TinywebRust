@@ -62,6 +62,12 @@ export default function Events({ identity }: Props) {
   const [events, setEvents] = useState<NodeEvent[]>([])
   const [users, setUsers] = useState<NodeUser[]>([])
   const [listErr, setListErr] = useState('')
+  // False until the first list fetch settles. Without it the first
+  // paint claimed "0 events / No events in the next 30 days" while
+  // the mount fetch was still in flight, which read as "the view
+  // does not auto-load" — the fetch below did fire on mount, the
+  // empty state was simply shown before its answer landed.
+  const [loaded, setLoaded] = useState(false)
   const [showDeleted, setShowDeleted] = useState(false)
   const [enrolled, setEnrolled] = useState<boolean | null>(null)
   const [busyId, setBusyId] = useState('')
@@ -86,6 +92,8 @@ export default function Events({ identity }: Props) {
     } catch (e) {
       setEvents([])
       setListErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoaded(true)
     }
   }, [showDeleted])
 
@@ -209,7 +217,7 @@ export default function Events({ identity }: Props) {
             show deleted
           </label>
           <span className="status-line">
-            {events.length} event{events.length === 1 ? '' : 's'}
+            {!loaded ? 'Loading…' : `${events.length} event${events.length === 1 ? '' : 's'}`}
           </span>
         </div>
         {enrolled === false && (
@@ -219,6 +227,7 @@ export default function Events({ identity }: Props) {
           </p>
         )}
         {listErr && <p className="status-line status-bad">{listErr}</p>}
+        {!loaded && !listErr && <p className="status-line">Loading…</p>}
         {events.map((ev) => (
           <div className="msg" key={ev.event_id}>
             <div className="meta">
@@ -253,7 +262,7 @@ export default function Events({ identity }: Props) {
             )}
           </div>
         ))}
-        {events.length === 0 && !listErr && (
+        {loaded && events.length === 0 && !listErr && (
           <p className="status-line">No events in the next 30 days.</p>
         )}
       </div>

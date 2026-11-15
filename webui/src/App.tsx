@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import keyStore from './utils/keystore'
+import { checkEnrollment, getEnrollmentMeta } from './utils/enrollment'
 import { getRawCalls, subscribeRawCalls, type RawCall } from './api'
 import { shortHex } from './utils/hex'
 import Dashboard from './pages/Dashboard'
@@ -18,6 +19,66 @@ export default function App() {
   const refreshIdentity = useCallback(() => {
     setIdentity(keyStore.isKeypairLoaded() ? keyStore.getPublicKeyHex() : null)
   }, [])
+
+  /**
+   * Re-read the stored identity/enrollment state. Approval only
+   * takes effect inside the Enroll tab's poll — checkEnrollment is
+   * what activates the member key and flips the stored meta to
+   * 'enrolled' — so if a parent approves while another tab is in
+   * front (or in another browser tab), the header badge and the
+   * Dashboard keep showing "no identity / waiting for approval"
+   * until the Enroll tab is revisited. Re-checking when the window
+   * regains focus, becomes visible, sees a storage write from
+   * another tab, or returns to the Dashboard closes that gap: a
+   * pending pairing is polled once, a keypair another tab
+   * activated is picked up from local storage, and the badge is
+   * refreshed from the keystore.
+   */
+  const rereadStoredState = useCallback(async () => {
+    try {
+      if (getEnrollmentMeta()?.phase === 'pending') {
+        await checkEnrollment()
+      }
+    } catch (e) {
+      console.error('Enrollment re-check failed:', e)
+    }
+    try {
+      const raw = localStorage.getItem('tinyweb_keypair')
+      if (raw) {
+        const storedPubkey = (JSON.parse(raw) as { publicKey?: string }).publicKey
+        const loadedPubkey = keyStore.isKeypairLoaded() ? keyStore.getPublicKeyHex() : null
+        if (storedPubkey && storedPubkey !== loadedPubkey) {
+          keyStore.cleanup()
+          await keyStore.loadKeypair('')
+        }
+      }
+    } catch (e) {
+      console.error('Identity re-read from storage failed:', e)
+    }
+    refreshIdentity()
+  }, [refreshIdentity])
+
+  useEffect(() => {
+    const onFocusOrStorage = () => void rereadStoredState()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void rereadStoredState()
+    }
+    window.addEventListener('focus', onFocusOrStorage)
+    window.addEventListener('storage', onFocusOrStorage)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.removeEventListener('focus', onFocusOrStorage)
+      window.removeEventListener('storage', onFocusOrStorage)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [rereadStoredState])
+
+  // Returning to the Dashboard is where a stale identity hurts
+  // most, and a tab click fires none of the window events above —
+  // re-read on arrival there too.
+  useEffect(() => {
+    if (tab === 'dashboard') void rereadStoredState()
+  }, [tab, rereadStoredState])
 
   useEffect(() => {
     let cancelled = false

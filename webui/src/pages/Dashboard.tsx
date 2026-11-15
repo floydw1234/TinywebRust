@@ -80,6 +80,28 @@ export default function Dashboard({ identity, onIdentityChanged, rawCalls }: Pro
     setEnrollMeta(getEnrollmentMeta())
   }, [identity])
 
+  // The meta above is a snapshot taken when the identity last
+  // changed. Enrollment can complete while this page sits open
+  // (approval activated from the Enroll tab, or in another browser
+  // tab), leaving the enrollment line stale. Re-read the stored
+  // meta whenever the window regains focus or becomes visible,
+  // and when another tab writes storage ('storage' fires only in
+  // documents other than the one that wrote).
+  useEffect(() => {
+    const reread = () => setEnrollMeta(getEnrollmentMeta())
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') reread()
+    }
+    window.addEventListener('focus', reread)
+    window.addEventListener('storage', reread)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.removeEventListener('focus', reread)
+      window.removeEventListener('storage', reread)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [])
+
   useEffect(() => {
     void refreshHealth()
     void refreshPeers()
