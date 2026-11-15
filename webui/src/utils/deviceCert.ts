@@ -1,6 +1,7 @@
 import sodium from 'libsodium-wrappers'
 import { sha256 } from '@noble/hashes/sha2.js'
 import { serializeDeviceCertificate, type DeviceCertificateData } from './protobuf'
+import { toHex } from './hex'
 
 /**
  * Device certificate construction — the page-side mirror of the
@@ -65,6 +66,70 @@ export function deviceCertificateDigest(
       sha256(new TextEncoder().encode(label)),
     ]),
   )
+}
+
+const REVOKE_DOMAIN = new Uint8Array([84, 87, 68, 69, 86, 82, 69, 86, 79, 75, 69, 0]) // "TWDEVREVOKE\0"
+
+/**
+ * Signing digest for a device revocation — the page-side mirror
+ * of the node's `device_revocation_digest` (rust/src/identity.rs):
+ *
+ *   digest = SHA256( "TWDEVREVOKE\0" || member_pubkey || device_pubkey
+ *                    || revoked_at (LE u64) || SHA256(reason) )
+ *
+ * In the parent authorization for POST /devices/revoke,
+ * `revoked_at` is the body's `timestamp` field, and the body's
+ * `reason` must be the exact string hashed here.
+ */
+export function deviceRevocationDigest(
+  memberPubkey: Uint8Array,
+  devicePubkey: Uint8Array,
+  revokedAt: number,
+  reason: string,
+): Uint8Array {
+  if (memberPubkey.length !== 32) throw new Error('Invalid member_pubkey length')
+  if (devicePubkey.length !== 32) throw new Error('Invalid device_pubkey length')
+  return sha256(
+    concat([
+      REVOKE_DOMAIN,
+      memberPubkey,
+      devicePubkey,
+      u64le(revokedAt),
+      sha256(new TextEncoder().encode(reason)),
+    ]),
+  )
+}
+
+export interface DeviceRevocationAuth {
+  parent_member_pubkey: string // hex
+  parent_device_pubkey: string // hex
+  timestamp: number
+  signature: string // hex
+}
+
+/**
+ * Build the parent authorization for POST /devices/revoke: the
+ * recorded parent's *device* key signs the revocation digest for
+ * the child's device. `parentDeviceSecretKey` is the 64-byte
+ * libsodium secret key of the parent's device keypair.
+ */
+export function buildDeviceRevocationAuth(
+  parentDeviceSecretKey: Uint8Array,
+  parentMemberPubkey: Uint8Array,
+  parentDevicePubkey: Uint8Array,
+  memberPubkey: Uint8Array,
+  devicePubkey: Uint8Array,
+  reason: string,
+  timestamp: number,
+): DeviceRevocationAuth {
+  const digest = deviceRevocationDigest(memberPubkey, devicePubkey, timestamp, reason)
+  const signature = sodium.crypto_sign_detached(digest, parentDeviceSecretKey)
+  return {
+    parent_member_pubkey: toHex(parentMemberPubkey),
+    parent_device_pubkey: toHex(parentDevicePubkey),
+    timestamp,
+    signature: toHex(signature),
+  }
 }
 
 export interface BuiltDeviceCertificate {

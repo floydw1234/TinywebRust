@@ -495,6 +495,8 @@ pub enum Route {
     Devices,
     /// `POST /devices/revoke` (Phase C1, DESIGN.md §5)
     RevokeDevice,
+    /// `GET /household/devices` (Phase C4, DESIGN.md §5)
+    HouseholdDevices,
     /// `POST /content/submit` (Phase C2, DESIGN.md §5)
     ContentSubmit,
     /// `GET /content/recent` (Phase C2, DESIGN.md §5)
@@ -532,6 +534,7 @@ pub fn route(path: &str) -> Route {
         "/content/recent" => Route::ContentRecent,
         "/devices" => Route::Devices,
         "/devices/revoke" => Route::RevokeDevice,
+        "/household/devices" => Route::HouseholdDevices,
         "/events" => Route::Events,
         _ => {
             if let Some(rest) = path.strip_prefix("/events/") {
@@ -600,6 +603,7 @@ fn allowed_methods_for(path: &str) -> &'static str {
         | "/messages/conversations"
         | "/users"
         | "/devices"
+        | "/household/devices"
         | "/enroll/status" => "GET, OPTIONS",
         _ if path.starts_with("/location/") => "GET, OPTIONS",
         _ => "GET, POST, OPTIONS",
@@ -973,6 +977,10 @@ pub fn handle_request(state: &ApiState, request: &Request) -> Response {
         },
         Route::RevokeDevice => match request.method.as_str() {
             "POST" => handle_revoke_device(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::HouseholdDevices => match request.method.as_str() {
+            "GET" => handle_household_devices(state, request),
             _ => Response::json_error(405, "Method Not Allowed"),
         },
         Route::ContentSubmit => match request.method.as_str() {
@@ -2366,6 +2374,22 @@ fn handle_remove_group_member(
     Response::json(200, out.to_string())
 }
 
+/// The JSON shape one device is reported in — shared by the
+/// C1 per-member list and the C4 household overview.
+fn device_json(d: &crate::store::DeviceEntry) -> serde_json::Value {
+    json!({
+        "device_pubkey": hex_encode(&d.device_pubkey),
+        "label": d.label,
+        "status": match d.status {
+            DeviceStatus::Active => "active",
+            DeviceStatus::Revoked => "revoked",
+        },
+        "issued_at": d.issued_at,
+        "expires_at": d.expires_at,
+        "revoked_at": d.revoked_at,
+    })
+}
+
 /// `GET /devices?member=<pubkey>` — one member's devices
 /// (label, status, issued/expires). The caller must be that
 /// member or a recorded parent of them; anyone else is refused
@@ -2400,26 +2424,91 @@ fn handle_list_devices(state: &ApiState, request: &Request) -> Response {
         Ok(d) => d,
         Err(_) => return Response::json_error(500, "Store error"),
     };
-    let list: Vec<serde_json::Value> = devices
-        .iter()
-        .map(|d| {
-            json!({
-                "device_pubkey": hex_encode(&d.device_pubkey),
-                "label": d.label,
-                "status": match d.status {
-                    DeviceStatus::Active => "active",
-                    DeviceStatus::Revoked => "revoked",
-                },
-                "issued_at": d.issued_at,
-                "expires_at": d.expires_at,
-                "revoked_at": d.revoked_at,
-            })
-        })
-        .collect();
+    let list: Vec<serde_json::Value> = devices.iter().map(device_json).collect();
     Response::json(
         200,
         json!({ "member": hex_encode(&member), "devices": list }).to_string(),
     )
+}
+
+/// `GET /household/devices` — the whole household's members
+/// with their devices (Phase C4). Unlike `GET /devices`, which
+/// answers only for the member or a recorded parent, this
+/// overview answers for ANY enrolled member: device pubkeys,
+/// labels and statuses are household directory data — the
+/// member list is already visible to every member via
+/// `GET /users`, and device certificates are gossiped signed
+/// records. No key material or private data is exposed, and
+/// revocation permissions are unchanged (member or recorded
+/// parent only, `POST /devices/revoke`). Each member's
+/// recorded parents ride along so a client can offer a revoke
+/// action exactly where the node will allow one, instead of
+/// guessing. Unauthenticated and not-enrolled requesters are
+/// refused and logged.
+fn handle_household_devices(state: &ApiState, request: &Request) -> Response {
+    let store = state.store.lock().unwrap();
+    let requester = match validate_request_auth(request, &store) {
+        Ok(k) => k,
+        Err(e) => {
+            devices_reject(
+                "household",
+                &format!("unauthenticated overview request: {}", e.error_string()),
+            );
+            return Response::json_error(401, e.error_string());
+        }
+    };
+    if !is_enrolled(&store, &requester) {
+        devices_reject(
+            "household",
+            &format!(
+                "{} is registered but not enrolled (no device on record)",
+                hex_encode(&requester)
+            ),
+        );
+        return Response::json_error(403, "Not enrolled");
+    }
+    // The same member listing as `GET /users` (active users,
+    // by name); the users table stores the pubkey as hex text.
+    let rows: Vec<(Option<String>, Option<String>)> = {
+        let conn = store.connection();
+        let mut stmt = match conn.prepare(
+            "SELECT pubkey, username FROM users WHERE is_active = 1 ORDER BY username;",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Response::json_error(500, "Prepare error"),
+        };
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        });
+        match mapped {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => return Response::json_error(500, "DB error"),
+        }
+    };
+    let mut members = Vec::new();
+    for (pubkey_hex, username) in &rows {
+        let Some(member) = pubkey_hex.as_deref().and_then(hex_decode_32) else {
+            continue; // a row without a usable pubkey has no devices to show
+        };
+        let devices = match store.device_list(&member) {
+            Ok(d) => d.iter().map(device_json).collect::<Vec<_>>(),
+            Err(_) => return Response::json_error(500, "Store error"),
+        };
+        let parents = store
+            .parents_of(&member)
+            .map(|ps| ps.iter().map(|p| hex_encode(p)).collect::<Vec<_>>())
+            .unwrap_or_default();
+        members.push(json!({
+            "member": hex_encode(&member),
+            "username": username,
+            "parents": parents,
+            "devices": devices,
+        }));
+    }
+    Response::json(200, json!({ "members": members }).to_string())
 }
 
 /// `POST /devices/revoke` — revoke one device. Two
@@ -4643,6 +4732,7 @@ mod tests {
         assert_eq!(route("/groups"), Route::Groups);
         assert_eq!(route("/devices"), Route::Devices);
         assert_eq!(route("/devices/revoke"), Route::RevokeDevice);
+        assert_eq!(route("/household/devices"), Route::HouseholdDevices);
         let gid = "ab".repeat(16);
         assert_eq!(
             route(&format!("/groups/{gid}/members")),
@@ -5016,6 +5106,102 @@ mod tests {
         );
         assert_eq!(
             handle_request(&state, &bare_request("GET", "/devices")).status,
+            401
+        );
+    }
+
+    #[test]
+    fn household_devices_overview_for_any_enrolled_member() {
+        let state = empty_state();
+        let parent = group_test_member(&state, "Parent");
+        let child = group_test_member(&state, "Child");
+        let stranger = group_test_member(&state, "Stranger");
+        {
+            let store = state.store.lock().unwrap();
+            store
+                .parent_link_add(&parent.member_pk, &child.member_pk)
+                .unwrap();
+            // One revoked device in the household: the child's.
+            store
+                .device_revoke(&child.member_pk, &child.device_pk, now_epoch())
+                .unwrap();
+        }
+
+        // Even a member who is neither the device owner nor a
+        // recorded parent may read the overview — it is
+        // household directory data.
+        let resp = handle_request(&state, &signed_get(&stranger, "/household/devices", ""));
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let members = v["members"].as_array().unwrap();
+        assert_eq!(members.len(), 3);
+        let by_member = |pk: &[u8; 32]| {
+            members
+                .iter()
+                .find(|m| m["member"] == hex_encode(pk))
+                .unwrap()
+                .clone()
+        };
+        let child_view = by_member(&child.member_pk);
+        assert_eq!(child_view["username"], "Child");
+        assert_eq!(
+            child_view["parents"],
+            json!([hex_encode(&parent.member_pk)])
+        );
+        assert_eq!(child_view["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            child_view["devices"][0]["device_pubkey"],
+            hex_encode(&child.device_pk)
+        );
+        assert_eq!(child_view["devices"][0]["label"], "phone");
+        // Revoked devices show as revoked, with the time.
+        assert_eq!(child_view["devices"][0]["status"], "revoked");
+        assert!(child_view["devices"][0]["revoked_at"].as_u64().is_some());
+        let parent_view = by_member(&parent.member_pk);
+        assert_eq!(parent_view["devices"][0]["status"], "active");
+        assert!(parent_view["parents"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn household_devices_rejects_unknown_and_unenrolled() {
+        let state = empty_state();
+        let _member = group_test_member(&state, "Member");
+
+        // Unknown requester: correctly signed, but the key is
+        // not registered at all — refused 401.
+        let ghost = SigningKey::from_bytes(&[77u8; 32]);
+        let ghost_pk = ghost.verifying_key().to_bytes();
+        let req = signed_request(
+            &ghost,
+            &ghost_pk,
+            "GET",
+            "/household/devices",
+            "",
+            now_epoch(),
+        );
+        assert_eq!(handle_request(&state, &req).status, 401);
+
+        // Registered but not enrolled (a bare `users` row with
+        // no device on record) — refused 403.
+        let bare = SigningKey::from_bytes(&[78u8; 32]);
+        let bare_pk = bare.verifying_key().to_bytes();
+        {
+            let store = state.store.lock().unwrap();
+            store.user_register(&bare_pk, "Bare").unwrap();
+        }
+        let req = signed_request(
+            &bare,
+            &bare_pk,
+            "GET",
+            "/household/devices",
+            "",
+            now_epoch(),
+        );
+        assert_eq!(handle_request(&state, &req).status, 403);
+
+        // No auth headers at all — refused 401.
+        assert_eq!(
+            handle_request(&state, &bare_request("GET", "/household/devices")).status,
             401
         );
     }

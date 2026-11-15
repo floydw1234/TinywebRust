@@ -1,5 +1,6 @@
 import sodium from 'libsodium-wrappers'
 import { signRequest } from './utils/requestAuth'
+import type { DeviceRevocationAuth } from './utils/deviceCert'
 import { decryptPayload } from './utils/encryption'
 import { fromHex, toHex } from './utils/hex'
 import {
@@ -537,4 +538,94 @@ export async function deleteEvent(eventIdHex: string, envelopeBytes: Uint8Array)
   })
   throwIfError(r, 'Failed to delete event')
   return r.json ?? r.text
+}
+
+// ---- Devices & household overview (Phase C1/C4) ----
+
+export interface NodeDevice {
+  device_pubkey: string // hex
+  label: string
+  status: 'active' | 'revoked'
+  issued_at: number // unix seconds
+  expires_at: number // unix seconds, 0 = never
+  revoked_at: number | null // unix seconds
+}
+
+export interface HouseholdMember {
+  member: string // hex member pubkey
+  username: string | null
+  /** Recorded parents of this member (hex member pubkeys). */
+  parents: string[]
+  devices: NodeDevice[]
+}
+
+/**
+ * GET /household/devices — every member with their devices
+ * (Phase C4). Answers for any enrolled member: device pubkeys,
+ * labels and statuses are household directory data. Revocation
+ * stays restricted to the member or a recorded parent (below).
+ */
+export async function getHouseholdDevices(): Promise<HouseholdMember[]> {
+  const r = await rawFetch('GET', '/household/devices', { signed: true })
+  throwIfError(r, 'Failed to load household devices')
+  return (r.json?.members || []) as HouseholdMember[]
+}
+
+export interface RevokeDeviceResult {
+  status: 'revoked' | 'already_revoked'
+  member_pubkey: string
+  device_pubkey: string
+}
+
+/**
+ * POST /devices/revoke, member mode: the request's TWREQUEST
+ * signature is the member key's, so this can only revoke the
+ * caller's own devices. A repeat revoke is not an error — the
+ * node answers 200 with status "already_revoked".
+ */
+export async function revokeOwnDevice(
+  memberPubkey: string,
+  devicePubkey: string,
+): Promise<RevokeDeviceResult> {
+  const r = await rawFetch('POST', '/devices/revoke', {
+    signed: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      member_pubkey: memberPubkey,
+      device_pubkey: devicePubkey,
+      reason: '',
+    }),
+  })
+  throwIfError(r, 'Failed to revoke device')
+  return r.json as RevokeDeviceResult
+}
+
+/**
+ * POST /devices/revoke, parent mode: a recorded parent revokes a
+ * child's device. The authorization rides in the body — the
+ * parent's device key signs the revocation digest (see
+ * buildDeviceRevocationAuth in utils/deviceCert.ts); `reason`
+ * must be the exact string that was hashed into the digest.
+ */
+export async function revokeDeviceAsParent(
+  memberPubkey: string,
+  devicePubkey: string,
+  reason: string,
+  auth: DeviceRevocationAuth,
+): Promise<RevokeDeviceResult> {
+  const r = await rawFetch('POST', '/devices/revoke', {
+    signed: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      member_pubkey: memberPubkey,
+      device_pubkey: devicePubkey,
+      reason,
+      parent_member_pubkey: auth.parent_member_pubkey,
+      parent_device_pubkey: auth.parent_device_pubkey,
+      timestamp: auth.timestamp,
+      signature: auth.signature,
+    }),
+  })
+  throwIfError(r, 'Failed to revoke device')
+  return r.json as RevokeDeviceResult
 }
