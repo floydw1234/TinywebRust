@@ -8,8 +8,8 @@ import {
 } from '../api'
 import { fromHex, shortHex } from '../utils/hex'
 import keyStore from '../utils/keystore'
-import { createSignedLocationRequest } from '../utils/clientRequest'
-import { serializeClientRequest, type LocationUpdateData } from '../utils/protobuf'
+import { createSignedLocationEnvelope } from '../utils/envelope'
+import { serializeEnvelope, type LocationUpdateData } from '../utils/protobuf'
 
 interface Props {
   identity: string | null
@@ -144,7 +144,7 @@ export default function Location({ identity }: Props) {
       const recipientHexes = [myHex]
       for (const h of extraRecipients.split(/[\s,]+/).filter(Boolean)) recipientHexes.push(h)
       const recipients = recipientHexes.map((h) => fromHex(h))
-      const req = await createSignedLocationRequest(
+      const req = await createSignedLocationEnvelope(
         {
           lat: latNum,
           lon: lonNum,
@@ -154,7 +154,7 @@ export default function Location({ identity }: Props) {
         },
         recipients,
       )
-      const res = await submitLocation(serializeClientRequest(req))
+      const res = await submitLocation(serializeEnvelope(req))
       setPostStatus(`Posted: ${JSON.stringify(res)}`)
       if (target === myHex) {
         void doLatest()

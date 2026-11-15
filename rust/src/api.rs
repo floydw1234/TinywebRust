@@ -1734,4 +1734,138 @@ mod tests {
         bad.payload_nonce = vec![0u8; 3];
         assert!(client_request_to_envelope(&bad).is_none());
     }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Build a location-update envelope (content type 33, self as
+    /// sole recipient, dummy ciphertext — the node never decrypts).
+    /// With `client_request_digest` the signature is computed over
+    /// the C-era client-request digest instead of the envelope
+    /// digest; everything else is identical.
+    fn build_location_envelope(
+        signing: &SigningKey,
+        pubkey: &[u8; 32],
+        timestamp: u64,
+        client_request_digest: bool,
+    ) -> Envelope {
+        let mut env = Envelope {
+            header: Some(crate::proto::EnvelopeHeader {
+                version: 1,
+                content_type: 33,
+                schema_version: 1,
+                timestamp,
+                sender_pubkey: pubkey.to_vec(),
+                recipients_pubkey: vec![pubkey.to_vec()],
+                group_id: Vec::new(),
+            }),
+            payload_nonce: vec![9u8; 24],
+            ephemeral_pubkey: vec![8u8; 32],
+            payload_ciphertext: b"location-ciphertext".to_vec(),
+            keywraps: vec![crate::proto::RecipientKeyWrap {
+                recipient_pubkey: pubkey.to_vec(),
+                key_nonce: vec![7u8; 24],
+                wrapped_key: vec![6u8; 48],
+            }],
+            signature: Vec::new(),
+        };
+        let digest = if client_request_digest {
+            let req = ClientRequest {
+                header: Some(crate::proto::ClientRequestHeader {
+                    version: 1,
+                    content_type: 33,
+                    schema_version: 1,
+                    timestamp,
+                    sender_pubkey: pubkey.to_vec(),
+                    recipients_pubkey: vec![pubkey.to_vec()],
+                    group_id: Vec::new(),
+                }),
+                payload_nonce: env.payload_nonce.clone(),
+                ephemeral_pubkey: env.ephemeral_pubkey.clone(),
+                payload_ciphertext: env.payload_ciphertext.clone(),
+                keywraps: vec![crate::proto::ClientRequestKeyWrap {
+                    recipient_pubkey: pubkey.to_vec(),
+                    key_nonce: vec![7u8; 24],
+                    wrapped_key: vec![6u8; 48],
+                }],
+                signature: Vec::new(),
+            };
+            validation::compute_client_request_signing_digest(&req).unwrap()
+        } else {
+            validation::compute_envelope_signing_digest(&env).unwrap()
+        };
+        env.signature = signing.sign(&digest).to_bytes().to_vec();
+        env
+    }
+
+    /// Regression test (Nov 14): a location update submitted through
+    /// the API layer, signed over the envelope digest as the wire
+    /// contract requires, is accepted and reads back through the
+    /// latest + history endpoints.
+    #[test]
+    fn location_update_round_trip_through_api() {
+        let (state, pubkey, signing) = test_state();
+        let now = now_epoch();
+        let env = build_location_envelope(&signing, &pubkey, now, false);
+        let mut req = signed_request(&signing, &pubkey, "POST", "/location/update", "", now);
+        req.body = env.encode_to_vec();
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 202,
+            "submit body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+
+        let path = format!("/location/{}", hex_encode(&pubkey));
+        let req = signed_request(&signing, &pubkey, "GET", &path, "", now);
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 200,
+            "latest body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["is_envelope"], true);
+        let stored = Envelope::decode(unhex(v["data_hex"].as_str().unwrap()).as_slice()).unwrap();
+        assert_eq!(stored.payload_ciphertext, env.payload_ciphertext);
+        assert_eq!(stored.header.unwrap().content_type, 33);
+
+        let path = format!("/location/history/{}", hex_encode(&pubkey));
+        let req = signed_request(&signing, &pubkey, "GET", &path, "", now);
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 200,
+            "history body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["updates"][0]["is_envelope"], true);
+    }
+
+    /// Regression test (Nov 14): the exact failure the test page hit —
+    /// a location submission signed over the client-request digest
+    /// (TWCLIENTREQ, the C web-ui's scheme) instead of the envelope
+    /// digest (TWENVELOPE) is rejected with "invalid signature". The
+    /// wire layouts are identical, so this pins the signing domain
+    /// as the contract.
+    #[test]
+    fn location_update_signed_as_client_request_is_rejected() {
+        let (state, pubkey, signing) = test_state();
+        let now = now_epoch();
+        let env = build_location_envelope(&signing, &pubkey, now, true);
+        let mut req = signed_request(&signing, &pubkey, "POST", "/location/update", "", now);
+        req.body = env.encode_to_vec();
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 400);
+        assert!(
+            String::from_utf8(resp.body)
+                .unwrap()
+                .contains("invalid signature")
+        );
+    }
 }

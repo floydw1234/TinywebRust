@@ -13,17 +13,34 @@ import {
 } from './protobuf'
 
 /**
- * ClientRequest construction + signing — ported from the C web-ui
- * (client/web-ui/src/utils/clientRequestHelper.js), matching the node
- * backend (src/packages/validation/client_request_validation.c).
+ * Location submission construction + signing.
  *
- * Digest = SHA256( "TWCLIENTREQ\0" || header fields (little-endian) ||
+ * A location submission is an **Envelope** on the wire: the node
+ * validates it with the gossip envelope validation, stores it as an
+ * envelope, and gossips it to peers as an envelope — and every
+ * envelope in the system is verified over the envelope signing
+ * digest:
+ *
+ * Digest = SHA256( "TWENVELOPE\0" || header fields (little-endian) ||
  *                  SHA256(ciphertext) )
  *
- * Note: the content type used here is 33 (CONTENT_LOCATION_UPDATE in
- * envelope.proto), which is what the node's envelope dispatcher routes
- * to the location handler. The old C web-ui used 1 here, which is
- * CONTENT_USER_REGISTRATION — that looks like a bug in the old UI.
+ * (matching rust/src/validation.rs `compute_envelope_signing_digest`).
+ *
+ * The C web-ui this page was ported from instead built a
+ * ClientRequest and signed the client-request digest (same field
+ * layout, but the "TWCLIENTREQ\0" domain). The C node accepted that
+ * because it unpacked ClientRequests and converted them; the Rust
+ * node treats the submission as the envelope it is, so a
+ * TWCLIENTREQ-signed submission is rejected with "invalid
+ * signature". ClientRequest and Envelope share an identical wire
+ * layout, so the encoded bytes are the same either way — only the
+ * signing domain differs.
+ *
+ * The content type is 33 (CONTENT_LOCATION_UPDATE in
+ * envelope.proto), which is what the node's envelope dispatcher
+ * routes to the location handler. The old C web-ui used 1 here,
+ * which is CONTENT_USER_REGISTRATION — that looks like a bug in the
+ * old UI.
  */
 
 function u32le(v: number): Uint8Array {
@@ -40,11 +57,11 @@ function u64le(v: number): Uint8Array {
   return b
 }
 
-export function computeClientRequestDigest(
+export function computeEnvelopeDigest(
   header: ClientRequestHeaderData,
   ciphertext: Uint8Array,
 ): Uint8Array {
-  const domain = new Uint8Array([84, 87, 67, 76, 73, 69, 78, 84, 82, 69, 81, 0]) // "TWCLIENTREQ\0"
+  const domain = new Uint8Array([84, 87, 69, 78, 86, 69, 76, 79, 80, 69, 0]) // "TWENVELOPE\0"
   const parts: Uint8Array[] = [domain]
   parts.push(u32le(header.version))
   parts.push(u32le(header.contentType))
@@ -73,10 +90,12 @@ export function computeClientRequestDigest(
 }
 
 /**
- * Build a signed ClientRequest carrying a LocationUpdate, encrypted to
- * the given Ed25519 recipient pubkeys.
+ * Build a signed Envelope carrying a LocationUpdate, encrypted to
+ * the given Ed25519 recipient pubkeys. (The returned object uses the
+ * shared ClientRequest/Envelope layout type; serialize it with
+ * `serializeEnvelope`.)
  */
-export async function createSignedLocationRequest(
+export async function createSignedLocationEnvelope(
   location: LocationUpdateData,
   recipientPubkeys: Uint8Array[],
 ): Promise<TinyClientRequest> {
@@ -102,7 +121,7 @@ export async function createSignedLocationRequest(
     groupId: null,
   }
 
-  const digest = computeClientRequestDigest(header, encryptedPayload.ciphertext)
+  const digest = computeEnvelopeDigest(header, encryptedPayload.ciphertext)
   const signature = sodium.crypto_sign_detached(digest, keyStore._getPrivateKey())
 
   return { header, encryptedPayload, signature }

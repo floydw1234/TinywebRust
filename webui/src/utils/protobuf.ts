@@ -325,30 +325,9 @@ export function decodeConversationList(bytes: Uint8Array): ConversationSummary[]
   })
 }
 
-// ---- ClientRequest ----
-
-export function serializeClientRequest(req: TinyClientRequest): Uint8Array {
-  const t = types()
-  const proto = {
-    header: {
-      version: req.header.version,
-      content_type: req.header.contentType,
-      schema_version: req.header.schemaVersion,
-      timestamp: req.header.timestamp,
-      sender_pubkey: req.header.senderPubkey,
-      recipients_pubkey: req.header.recipientsPubkey,
-      group_id: req.header.groupId || new Uint8Array(0),
-    },
-    payload_nonce: req.encryptedPayload.nonce,
-    ephemeral_pubkey: req.encryptedPayload.ephemeralPubkey,
-    payload_ciphertext: req.encryptedPayload.ciphertext,
-    keywraps: keywrapsFromPayload(req.encryptedPayload, req.header.recipientsPubkey),
-    signature: req.signature,
-  }
-  const err = t.ClientRequest.verify(proto)
-  if (err) throw new Error(`Invalid ClientRequest: ${err}`)
-  return new Uint8Array(t.ClientRequest.encode(t.ClientRequest.create(proto)).finish())
-}
+// ---- ClientRequest (legacy decode only: stored pre-envelope ----
+// location records may still be ClientRequest bytes; new
+// submissions are Envelopes, so there is no serializeClientRequest.)
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function clientRequestFromDecoded(r: any): TinyClientRequest {
@@ -380,7 +359,36 @@ export function deserializeClientRequest(bytes: Uint8Array): TinyClientRequest {
   return clientRequestFromDecoded(t.ClientRequest.decode(bytes))
 }
 
-// ---- Envelope (same field layout as ClientRequest, plus content type) ----
+// ---- Envelope (same field layout as ClientRequest) ----
+
+/**
+ * Serialize a submission as an Envelope. Location updates are
+ * envelopes on the wire (see utils/envelope.ts); the encoding is
+ * byte-identical to the ClientRequest layout, only the protobuf
+ * type — and the signing domain — differ.
+ */
+export function serializeEnvelope(req: TinyClientRequest): Uint8Array {
+  const t = types()
+  const proto = {
+    header: {
+      version: req.header.version,
+      content_type: req.header.contentType,
+      schema_version: req.header.schemaVersion,
+      timestamp: req.header.timestamp,
+      sender_pubkey: req.header.senderPubkey,
+      recipients_pubkey: req.header.recipientsPubkey,
+      group_id: req.header.groupId || new Uint8Array(0),
+    },
+    payload_nonce: req.encryptedPayload.nonce,
+    ephemeral_pubkey: req.encryptedPayload.ephemeralPubkey,
+    payload_ciphertext: req.encryptedPayload.ciphertext,
+    keywraps: keywrapsFromPayload(req.encryptedPayload, req.header.recipientsPubkey),
+    signature: req.signature,
+  }
+  const err = t.Envelope.verify(proto)
+  if (err) throw new Error(`Invalid Envelope: ${err}`)
+  return new Uint8Array(t.Envelope.encode(t.Envelope.create(proto)).finish())
+}
 
 export function deserializeEnvelope(bytes: Uint8Array): TinyClientRequest {
   const t = types()
