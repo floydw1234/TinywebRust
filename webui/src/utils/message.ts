@@ -83,6 +83,8 @@ export async function createSignedMessage(
     header: { ...header },
     encryptedPayload: encrypted,
     signature: new Uint8Array(0),
+    sessionId: new Uint8Array(0),
+    messageIndex: 0,
   }
   const digest = computeMessageDigest(message.header, encrypted.ciphertext)
   message.signature = sodium.crypto_sign_detached(digest, keyStore._getPrivateKey())

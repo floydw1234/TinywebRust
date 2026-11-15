@@ -1078,6 +1078,57 @@ pub fn skipped_key_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Known-answer vector for the ratchet + seal construction,
+    /// pinned so the client implementations (the test page's
+    /// TypeScript mirror in webui/src/utils/groupSession.ts) can
+    /// prove byte-compatibility against the node's own code.
+    /// If these values ever change, the wire format has changed.
+    #[test]
+    fn ratchet_known_answer_vector() {
+        let root = [0x11u8; 32];
+        let mk0 = derive_message_key(&root);
+        assert_eq!(
+            hex(&mk0),
+            "d00408aa711fd302fe2e80959c56642654223ca7058c36901a867afe92381787"
+        );
+        let chain1 = advance_chain_key(&root);
+        assert_eq!(
+            hex(&chain1),
+            "3878f4eac1458397a520067d0087ba0967bd15e06d3b86b7312ef5d222fe2b31"
+        );
+        let mk1 = derive_message_key(&chain1);
+        assert_eq!(
+            hex(&mk1),
+            "5f0db29d692d81264311840d4d68e37e2ebf6eee053ad432270396d996207a2a"
+        );
+        let nonce0 = message_nonce(&mk0);
+        assert_eq!(hex(&nonce0), "3c72c3cd2c2374b4aaf2d53c4c6f654c052753766220d39f");
+        let group = [0x22u8; 16];
+        let session = [0x33u8; 16];
+        let sender = [0x44u8; 32];
+        let aad = message_aad(&group, &session, 0, &sender);
+        let ct = seal_message(&mk0, &nonce0, &aad, b"tinyweb group kat").unwrap();
+        assert_eq!(
+            hex(&ct),
+            "79689d035c8fdd061ea5f28fe42da76ff9606b049e1f7bd0c8bc2f47bab56e845e"
+        );
+        let wrapped_hash = sha256(b"kat wrapped key");
+        let digest = group_share_digest(
+            &group,
+            &session,
+            &sender,
+            &[0x55u8; 32],
+            &[0x66u8; 32],
+            &[0x77u8; 32],
+            1_700_000_000,
+            &wrapped_hash,
+        );
+        assert_eq!(
+            hex(&digest),
+            "ebca0a43923dd18692564345fcc5f2fc8c6439e3842b7f0dca484ab36fe72340"
+        );
+    }
     use crate::proto::GroupMessage;
 
     const NOW: u64 = 1_700_000_000;

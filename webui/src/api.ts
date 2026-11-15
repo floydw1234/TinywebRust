@@ -360,3 +360,117 @@ export async function decryptMessageText(msg: TinyMessage): Promise<string | nul
     return null
   }
 }
+
+// ---- Groups (Phase C1) + content path (Phase C2) ----
+
+export interface NodeGroup {
+  group_id: string // hex, 16 bytes
+  name: string
+  creator: string // hex member pubkey
+  created_at: number
+  members: string[] // hex member pubkeys
+}
+
+/** GET /groups — the caller's groups, with member lists. */
+export async function getGroups(): Promise<NodeGroup[]> {
+  const r = await rawFetch('GET', '/groups', { signed: true })
+  throwIfError(r, 'Failed to list groups')
+  return (r.json?.groups || []) as NodeGroup[]
+}
+
+/** POST /groups — create a group; the creator is always a member. */
+export async function createGroup(name: string, members: string[]): Promise<NodeGroup> {
+  const r = await rawFetch('POST', '/groups', {
+    signed: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, members }),
+  })
+  throwIfError(r, 'Failed to create group')
+  return r.json as NodeGroup
+}
+
+/** POST /groups/:id/members — add a member (triggers session rotation node-side). */
+export async function addGroupMember(groupId: string, memberPubkey: string): Promise<NodeGroup> {
+  const r = await rawFetch('POST', `/groups/${groupId}/members`, {
+    signed: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ member_pubkey: memberPubkey }),
+  })
+  throwIfError(r, 'Failed to add group member')
+  return r.json as NodeGroup
+}
+
+/** DELETE /groups/:id/members/:pubkey — remove a member (rotation node-side). */
+export async function removeGroupMember(groupId: string, memberPubkey: string): Promise<unknown> {
+  const r = await rawFetch('DELETE', `/groups/${groupId}/members/${memberPubkey}`, {
+    signed: true,
+  })
+  throwIfError(r, 'Failed to remove group member')
+  return r.json ?? r.text
+}
+
+export interface ShareRecipientSet {
+  group_id: string
+  /** Trusted devices that receive a session share, B4 distribution. */
+  devices: Array<{ member_pubkey: string; device_pubkey: string }>
+  /** Non-member parents at "recipients and times": metadata records, never keys. */
+  metadata_parents: string[]
+  /** Non-member parents at "full": their devices are already in `devices`. */
+  full_parents: string[]
+}
+
+/**
+ * GET /groups/:id/share-recipients?sender_device=... — the node's
+ * own B4 distribution for this group, for the caller as sender.
+ * (GET /devices answers only for the caller or their children, so
+ * this is how a sender learns the other members' device keys.)
+ */
+export async function getGroupShareRecipients(
+  groupId: string,
+  senderDeviceHex: string,
+): Promise<ShareRecipientSet> {
+  const r = await rawFetch(
+    'GET',
+    `/groups/${groupId}/share-recipients?sender_device=${senderDeviceHex}`,
+    { signed: true },
+  )
+  throwIfError(r, 'Failed to get share recipients')
+  return r.json as ShareRecipientSet
+}
+
+/** POST /content/submit — one signed Envelope (share or metadata). */
+export async function submitContent(envelopeBytes: Uint8Array): Promise<unknown> {
+  const r = await rawFetch('POST', '/content/submit', {
+    signed: true,
+    headers: { 'Content-Type': 'application/x-protobuf' },
+    body: envelopeBytes as BodyInit,
+  })
+  throwIfError(r, 'Failed to submit content')
+  return r.json ?? r.text
+}
+
+export interface FetchedEnvelope {
+  content_type: number
+  timestamp: number
+  /** Serialized Envelope, hex. */
+  envelope: string
+}
+
+/**
+ * GET /content/recent?for=... — envelopes sent by or addressed to
+ * the `for` key (a member key or one of the caller's device keys).
+ * Default content type 25 = group key shares.
+ */
+export async function getContentRecent(
+  forHex: string,
+  contentType = 25,
+  limit = 100,
+): Promise<FetchedEnvelope[]> {
+  const r = await rawFetch(
+    'GET',
+    `/content/recent?for=${forHex}&content_type=${contentType}&limit=${limit}`,
+    { signed: true },
+  )
+  throwIfError(r, 'Failed to fetch content')
+  return (r.json?.envelopes || []) as FetchedEnvelope[]
+}

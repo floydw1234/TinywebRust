@@ -20,6 +20,10 @@ export interface TinyMessage {
   header: MessageHeaderData
   encryptedPayload: EncryptedPayload
   signature: Uint8Array
+  /** Sender-session id (Message field 7); empty for legacy wrap messages. */
+  sessionId: Uint8Array
+  /** Sender-session ratchet index (Message field 8); 0 for legacy messages. */
+  messageIndex: number
 }
 
 export interface ClientRequestHeaderData {
@@ -82,6 +86,36 @@ const PROTO_DEFINITION = `
     bytes payload_ciphertext = 4;
     repeated MessageRecipientKeyWrap keywraps = 5;
     bytes signature = 6;
+    bytes session_id = 7;
+    uint64 message_index = 8;
+  }
+
+  message GroupMessage {
+    string text = 1;
+    bytes group_id = 2;
+    bytes media_ref = 3;
+    uint64 reply_to_timestamp = 4;
+  }
+
+  message GroupKeyShare {
+    bytes group_id = 1;
+    bytes session_id = 2;
+    bytes sender_member_pubkey = 3;
+    bytes sender_device_pubkey = 4;
+    bytes recipient_member_pubkey = 5;
+    bytes recipient_device_pubkey = 6;
+    uint64 created_at = 7;
+    bytes wrapped_key_hash = 8;
+    bytes signature = 9;
+  }
+
+  message ConversationMetadata {
+    bytes group_id = 1;
+    bytes sender_member_pubkey = 2;
+    repeated bytes recipient_member_pubkeys = 3;
+    uint64 message_timestamp = 4;
+    bytes session_id = 5;
+    uint64 message_index = 6;
   }
 
   message MessageList {
@@ -177,6 +211,9 @@ interface Types {
   Envelope: protobuf.Type
   LocationUpdate: protobuf.Type
   DeviceCertificate: protobuf.Type
+  GroupMessage: protobuf.Type
+  GroupKeyShare: protobuf.Type
+  ConversationMetadata: protobuf.Type
 }
 
 let cached: Types | null = null
@@ -192,6 +229,9 @@ function types(): Types {
     Envelope: root.lookupType('tinyweb.Envelope'),
     LocationUpdate: root.lookupType('tinyweb.LocationUpdate'),
     DeviceCertificate: root.lookupType('tinyweb.DeviceCertificate'),
+    GroupMessage: root.lookupType('tinyweb.GroupMessage'),
+    GroupKeyShare: root.lookupType('tinyweb.GroupKeyShare'),
+    ConversationMetadata: root.lookupType('tinyweb.ConversationMetadata'),
   }
   return cached
 }
@@ -263,8 +303,13 @@ export function serializeMessage(msg: TinyMessage): Uint8Array {
     payload_nonce: msg.encryptedPayload.nonce,
     ephemeral_pubkey: msg.encryptedPayload.ephemeralPubkey,
     payload_ciphertext: msg.encryptedPayload.ciphertext,
-    keywraps: keywrapsFromPayload(msg.encryptedPayload, msg.header.recipientsPubkey),
+    keywraps:
+      msg.sessionId && msg.sessionId.length > 0
+        ? []
+        : keywrapsFromPayload(msg.encryptedPayload, msg.header.recipientsPubkey),
     signature: msg.signature,
+    session_id: msg.sessionId || new Uint8Array(0),
+    message_index: msg.messageIndex || 0,
   }
   const err = t.Message.verify(proto)
   if (err) throw new Error(`Invalid message: ${err}`)
@@ -291,6 +336,8 @@ function messageFromDecoded(m: any): TinyMessage {
       recipients,
     ),
     signature: asBytes(m.signature),
+    sessionId: asBytes(m.session_id),
+    messageIndex: Number(m.message_index || 0),
   }
 }
 
@@ -482,5 +529,194 @@ export function deserializeDeviceCertificate(bytes: Uint8Array): DeviceCertifica
     issuedAt: Number(c.issued_at || 0),
     expiresAt: Number(c.expires_at || 0),
     signature: asBytes(c.signature),
+  }
+}
+
+// ---- GroupMessage (content.proto; group chat plaintext, Phase B4) ----
+
+export interface GroupMessageData {
+  text: string
+  groupId: Uint8Array
+  mediaRef: Uint8Array
+  replyToTimestamp: number
+}
+
+export function encodeGroupMessage(msg: GroupMessageData): Uint8Array {
+  const t = types()
+  const proto = {
+    text: msg.text,
+    group_id: msg.groupId,
+    media_ref: msg.mediaRef || new Uint8Array(0),
+    reply_to_timestamp: msg.replyToTimestamp || 0,
+  }
+  const err = t.GroupMessage.verify(proto)
+  if (err) throw new Error(`Invalid GroupMessage: ${err}`)
+  return new Uint8Array(t.GroupMessage.encode(t.GroupMessage.create(proto)).finish())
+}
+
+export function decodeGroupMessage(bytes: Uint8Array): GroupMessageData {
+  const t = types()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = t.GroupMessage.decode(bytes) as any
+  return {
+    text: m.text || '',
+    groupId: asBytes(m.group_id),
+    mediaRef: asBytes(m.media_ref),
+    replyToTimestamp: Number(m.reply_to_timestamp || 0),
+  }
+}
+
+// ---- GroupKeyShare (content.proto; sender-session handout, Phase B4) ----
+
+export interface GroupKeyShareData {
+  groupId: Uint8Array
+  sessionId: Uint8Array
+  senderMemberPubkey: Uint8Array
+  senderDevicePubkey: Uint8Array
+  recipientMemberPubkey: Uint8Array
+  recipientDevicePubkey: Uint8Array
+  createdAt: number
+  wrappedKeyHash: Uint8Array
+  signature: Uint8Array
+}
+
+export function serializeGroupKeyShare(share: GroupKeyShareData): Uint8Array {
+  const t = types()
+  const proto = {
+    group_id: share.groupId,
+    session_id: share.sessionId,
+    sender_member_pubkey: share.senderMemberPubkey,
+    sender_device_pubkey: share.senderDevicePubkey,
+    recipient_member_pubkey: share.recipientMemberPubkey,
+    recipient_device_pubkey: share.recipientDevicePubkey,
+    created_at: share.createdAt,
+    wrapped_key_hash: share.wrappedKeyHash,
+    signature: share.signature,
+  }
+  const err = t.GroupKeyShare.verify(proto)
+  if (err) throw new Error(`Invalid GroupKeyShare: ${err}`)
+  return new Uint8Array(t.GroupKeyShare.encode(t.GroupKeyShare.create(proto)).finish())
+}
+
+export function deserializeGroupKeyShare(bytes: Uint8Array): GroupKeyShareData {
+  const t = types()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const s = t.GroupKeyShare.decode(bytes) as any
+  return {
+    groupId: asBytes(s.group_id),
+    sessionId: asBytes(s.session_id),
+    senderMemberPubkey: asBytes(s.sender_member_pubkey),
+    senderDevicePubkey: asBytes(s.sender_device_pubkey),
+    recipientMemberPubkey: asBytes(s.recipient_member_pubkey),
+    recipientDevicePubkey: asBytes(s.recipient_device_pubkey),
+    createdAt: Number(s.created_at || 0),
+    wrappedKeyHash: asBytes(s.wrapped_key_hash),
+    signature: asBytes(s.signature),
+  }
+}
+
+// ---- ConversationMetadata (content.proto; recipients-and-times, Phase B4) ----
+
+export interface ConversationMetadataData {
+  groupId: Uint8Array
+  senderMemberPubkey: Uint8Array
+  recipientMemberPubkeys: Uint8Array[]
+  messageTimestamp: number
+  sessionId: Uint8Array
+  messageIndex: number
+}
+
+export function serializeConversationMetadata(meta: ConversationMetadataData): Uint8Array {
+  const t = types()
+  const proto = {
+    group_id: meta.groupId,
+    sender_member_pubkey: meta.senderMemberPubkey,
+    recipient_member_pubkeys: meta.recipientMemberPubkeys,
+    message_timestamp: meta.messageTimestamp,
+    session_id: meta.sessionId,
+    message_index: meta.messageIndex,
+  }
+  const err = t.ConversationMetadata.verify(proto)
+  if (err) throw new Error(`Invalid ConversationMetadata: ${err}`)
+  return new Uint8Array(
+    t.ConversationMetadata.encode(t.ConversationMetadata.create(proto)).finish(),
+  )
+}
+
+// ---- Raw envelopes (share + metadata transport, Phase C2) ----
+
+/**
+ * An Envelope whose payload fields are carried verbatim — unlike
+ * TinyClientRequest, whose payload is an EncryptedPayload (the
+ * location shape). Group key shares ride an envelope whose
+ * payload_ciphertext is the serialized GroupKeyShare in the
+ * clear and whose single key wrap carries the session root key,
+ * so the share path needs the raw field layout.
+ */
+export interface RawEnvelope {
+  header: ClientRequestHeaderData
+  payloadNonce: Uint8Array
+  ephemeralPubkey: Uint8Array
+  payloadCiphertext: Uint8Array
+  keywraps: Array<{
+    recipientPubkey: Uint8Array
+    keyNonce: Uint8Array
+    wrappedKey: Uint8Array
+  }>
+  signature: Uint8Array
+}
+
+export function serializeRawEnvelope(env: RawEnvelope): Uint8Array {
+  const t = types()
+  const proto = {
+    header: {
+      version: env.header.version,
+      content_type: env.header.contentType,
+      schema_version: env.header.schemaVersion,
+      timestamp: env.header.timestamp,
+      sender_pubkey: env.header.senderPubkey,
+      recipients_pubkey: env.header.recipientsPubkey,
+      group_id: env.header.groupId || new Uint8Array(0),
+    },
+    payload_nonce: env.payloadNonce,
+    ephemeral_pubkey: env.ephemeralPubkey,
+    payload_ciphertext: env.payloadCiphertext,
+    keywraps: env.keywraps.map((w) => ({
+      recipient_pubkey: w.recipientPubkey,
+      key_nonce: w.keyNonce,
+      wrapped_key: w.wrappedKey,
+    })),
+    signature: env.signature,
+  }
+  const err = t.Envelope.verify(proto)
+  if (err) throw new Error(`Invalid Envelope: ${err}`)
+  return new Uint8Array(t.Envelope.encode(t.Envelope.create(proto)).finish())
+}
+
+export function deserializeRawEnvelope(bytes: Uint8Array): RawEnvelope {
+  const t = types()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const e = t.Envelope.decode(bytes) as any
+  const recipients = (e.header.recipients_pubkey || []).map((pk: unknown) => asBytes(pk))
+  return {
+    header: {
+      version: e.header.version,
+      contentType: e.header.content_type,
+      schemaVersion: e.header.schema_version,
+      timestamp: Number(e.header.timestamp),
+      senderPubkey: asBytes(e.header.sender_pubkey),
+      recipientsPubkey: recipients,
+      groupId:
+        e.header.group_id && e.header.group_id.length > 0 ? asBytes(e.header.group_id) : null,
+    },
+    payloadNonce: asBytes(e.payload_nonce),
+    ephemeralPubkey: asBytes(e.ephemeral_pubkey),
+    payloadCiphertext: asBytes(e.payload_ciphertext),
+    keywraps: (e.keywraps || []).map((w: KeyWrapLike) => ({
+      recipientPubkey: asBytes(w.recipient_pubkey),
+      keyNonce: asBytes(w.key_nonce),
+      wrappedKey: asBytes(w.wrapped_key),
+    })),
+    signature: asBytes(e.signature),
   }
 }

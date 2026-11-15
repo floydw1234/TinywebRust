@@ -36,7 +36,8 @@ use sha2::{Digest, Sha256};
 
 use crate::gossip::GossipService;
 use crate::proto::{
-    ClientRequest, ConversationList, DeviceCertificate, Envelope, Message, MessageList,
+    ClientRequest, ConversationList, DeviceCertificate, Envelope, GroupKeyShare, Message,
+    MessageList,
 };
 use crate::store::{
     DeviceStatus, GroupRecord, PermissionScope, Store, PERMISSION_VIEW_LOCATION,
@@ -494,6 +495,12 @@ pub enum Route {
     Devices,
     /// `POST /devices/revoke` (Phase C1, DESIGN.md §5)
     RevokeDevice,
+    /// `POST /content/submit` (Phase C2, DESIGN.md §5)
+    ContentSubmit,
+    /// `GET /content/recent` (Phase C2, DESIGN.md §5)
+    ContentRecent,
+    /// `GET /groups/:id/share-recipients` (Phase C2)
+    GroupShareRecipients { group_id: String },
     /// No route matched: C replies 404.
     NotFound,
 }
@@ -517,12 +524,19 @@ pub fn route(path: &str) -> Route {
         "/enroll/approve" => Route::EnrollApprove,
         "/enroll/status" => Route::EnrollStatus,
         "/groups" => Route::Groups,
+        "/content/submit" => Route::ContentSubmit,
+        "/content/recent" => Route::ContentRecent,
         "/devices" => Route::Devices,
         "/devices/revoke" => Route::RevokeDevice,
         _ => {
             if let Some(rest) = path.strip_prefix("/groups/") {
                 let parts: Vec<&str> = rest.split('/').collect();
                 match parts.as_slice() {
+                    [id, "share-recipients"] if !id.is_empty() => {
+                        return Route::GroupShareRecipients {
+                            group_id: id.to_string(),
+                        };
+                    }
                     [id, "members"] if !id.is_empty() => {
                         return Route::GroupMembers {
                             group_id: id.to_string(),
@@ -561,9 +575,10 @@ pub fn route(path: &str) -> Route {
 fn allowed_methods_for(path: &str) -> &'static str {
     match path {
         "/messages/submit" | "/gossip/message" | "/location/update" | "/enroll/begin"
-        | "/enroll/approve" | "/devices/revoke" => "POST, OPTIONS",
+        | "/enroll/approve" | "/devices/revoke" | "/content/submit" => "POST, OPTIONS",
         "/groups" => "GET, POST, OPTIONS",
         _ if path.starts_with("/groups/") => "GET, POST, DELETE, OPTIONS",
+        "/content/recent" => "GET, OPTIONS",
         "/gossip/peers"
         | "/health"
         | "/messages/recent"
@@ -944,6 +959,18 @@ pub fn handle_request(state: &ApiState, request: &Request) -> Response {
         },
         Route::RevokeDevice => match request.method.as_str() {
             "POST" => handle_revoke_device(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::ContentSubmit => match request.method.as_str() {
+            "POST" => handle_content_submit(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::ContentRecent => match request.method.as_str() {
+            "GET" => handle_content_recent(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::GroupShareRecipients { group_id } => match request.method.as_str() {
+            "GET" => handle_group_share_recipients(state, request, &group_id),
             _ => Response::json_error(405, "Method Not Allowed"),
         },
         Route::NotFound => Response::json_error(404, "Not Found"),
@@ -2523,6 +2550,421 @@ fn handle_revoke_device(state: &ApiState, request: &Request) -> Response {
             "status": if changed { "revoked" } else { "already_revoked" },
             "member_pubkey": hex_encode(&member),
             "device_pubkey": hex_encode(&device),
+        })
+        .to_string(),
+    )
+}
+
+
+// -- content path (Phase C2, DESIGN.md §5) -------------------------------
+
+fn content_reject(context: &str, reason: &str) {
+    eprintln!("api content: rejected {context}: {reason}");
+}
+
+/// `POST /content/submit` — the generalized content path
+/// (DESIGN.md §5): one signed `Envelope` submitted by an
+/// enrolled member over TWREQUEST auth, stored in the same
+/// envelope store the gossip pipeline maintains. Until Phase
+/// C2 the only envelope a client could submit was a location
+/// update, and group key shares (Phase B4) had no client path
+/// at all — they could only be produced by code running
+/// against the node's own store.
+///
+/// Accepted content types:
+/// - 25 (`CONTENT_GROUP_KEY_SHARE`): the share's sender member
+///   must be the requester, and the share must pass the same
+///   verification gossip ingest applies
+///   ([`crate::sessions::verify_share_envelope`]: share and
+///   envelope signatures, both devices enrolled and currently
+///   trusted). The share is also written to the share audit
+///   table, as `sessions::start_session` does for node-local
+///   senders.
+/// - 35 (`CONTENT_CONVERSATION_METADATA`): the recipients-and-
+///   times visibility record for a non-member parent. The
+///   envelope sender must be the requester (the envelope is
+///   signed by the sender's member key), the requester must be
+///   a member of the envelope's group, and every recipient
+///   must be a registered user. (The payload is encrypted to
+///   the parent; the node checks headers only.)
+/// Anything else is refused and logged — the typed endpoints
+/// (messages, location) remain the path for their own types.
+fn handle_content_submit(state: &ApiState, request: &Request) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    if request.body.is_empty() {
+        content_reject("submit", "empty body");
+        return Response::json_error(400, "Empty body");
+    }
+    if request.body.len() > MAX_BODY_BYTES {
+        content_reject("submit", "body too large");
+        return Response::json_error(413, "Payload too large");
+    }
+    let envelope = match Envelope::decode(request.body.as_slice()) {
+        Ok(e) => e,
+        Err(_) => {
+            content_reject("submit", "body is not a valid Envelope protobuf");
+            return Response::json_error(400, "Invalid protobuf");
+        }
+    };
+    if let Err(e) = validation::gossip_validate_envelope(
+        &envelope,
+        &state.validation_config,
+        now_epoch(),
+    ) {
+        let result = Err(e);
+        let reason = validation::gossip_validation_error_string(&result);
+        content_reject("submit", &format!("envelope validation failed: {reason}"));
+        return Response::json_error(400, reason);
+    }
+    let header = envelope.header.as_ref().expect("validated envelope has header");
+    let content_type = header.content_type;
+    let now = now_epoch();
+
+    // Per-type authorization and content verification, under
+    // one store lock; storage happens below on success.
+    let share_audit: Option<(GroupKeyShare, [u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE], [u8; PUBKEY_SIZE])> = {
+        let store = state.store.lock().unwrap();
+        match content_type {
+            crate::sessions::CONTENT_GROUP_KEY_SHARE => {
+                let share = match GroupKeyShare::decode(envelope.payload_ciphertext.as_slice()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        content_reject("submit share", "payload does not decode as GroupKeyShare");
+                        return Response::json_error(400, "Invalid share payload");
+                    }
+                };
+                if share.sender_member_pubkey != requester.as_slice() {
+                    content_reject(
+                        "submit share",
+                        &format!(
+                            "share sender member {} is not the requester {}",
+                            hex_encode(&share.sender_member_pubkey),
+                            hex_encode(&requester)
+                        ),
+                    );
+                    return Response::json_error(
+                        403,
+                        "Share sender must be the requesting member",
+                    );
+                }
+                if let Err(e) = crate::sessions::verify_share_envelope(&store, &envelope, now) {
+                    content_reject("submit share", &format!("share rejected: {e}"));
+                    return Response::json_error(
+                        403,
+                        &format!("Group key share rejected: {e}"),
+                    );
+                }
+                let mut sm = [0u8; PUBKEY_SIZE];
+                sm.copy_from_slice(&share.sender_member_pubkey);
+                let mut sd = [0u8; PUBKEY_SIZE];
+                sd.copy_from_slice(&share.sender_device_pubkey);
+                let mut rm = [0u8; PUBKEY_SIZE];
+                rm.copy_from_slice(&share.recipient_member_pubkey);
+                let mut rd = [0u8; PUBKEY_SIZE];
+                rd.copy_from_slice(&share.recipient_device_pubkey);
+                Some((share, sm, sd, rm, rd))
+            }
+            crate::sessions::CONTENT_CONVERSATION_METADATA => {
+                if header.sender_pubkey != requester.as_slice() {
+                    content_reject(
+                        "submit metadata",
+                        "envelope sender is not the requester",
+                    );
+                    return Response::json_error(
+                        403,
+                        "Metadata sender must be the requesting member",
+                    );
+                }
+                // The metadata payload itself is encrypted to
+                // the parent's member key, so the node cannot
+                // (and must not) inspect it; the checks here are
+                // the header-level ones: signed by the requester
+                // (gossip validation above), requester is a
+                // group member, recipients are registered users.
+                let members = match store.conversation_members(&header.group_id) {
+                    Ok(m) => m,
+                    Err(_) => return Response::json_error(500, "Store error"),
+                };
+                if !members.contains(&requester) {
+                    content_reject(
+                        "submit metadata",
+                        &format!(
+                            "requester {} is not a member of group {}",
+                            hex_encode(&requester),
+                            hex_encode(&header.group_id)
+                        ),
+                    );
+                    return Response::json_error(403, "Sender is not a group member");
+                }
+                for recipient in &header.recipients_pubkey {
+                    let Ok(recipient_key) =
+                        <[u8; PUBKEY_SIZE]>::try_from(recipient.as_slice())
+                    else {
+                        return Response::json_error(403, "Recipient not registered");
+                    };
+                    if !store.user_exists(&recipient_key) {
+                        content_reject(
+                            "submit metadata",
+                            &format!("recipient {} is not registered", hex_encode(&recipient_key)),
+                        );
+                        return Response::json_error(403, "Recipient not registered");
+                    }
+                }
+                None
+            }
+            other => {
+                content_reject(
+                    "submit",
+                    &format!("content type {other} is not accepted on /content/submit"),
+                );
+                return Response::json_error(
+                    400,
+                    &format!("Content type {other} is not accepted here"),
+                );
+            }
+        }
+    };
+
+    // Dedup + store, mirroring gossip ingest steps 3-4.
+    let digest = crate::store::location_store_compute_digest_envelope(&envelope);
+    let expires_at = validation::gossip_validation_expiration(&envelope, &state.validation_config);
+    {
+        let store = state.store.lock().unwrap();
+        match store.gossip_store_has_seen(&digest) {
+            Ok(true) => return Response::json(202, "{\"status\":\"duplicate\"}"),
+            Ok(false) => {}
+            Err(_) => return Response::json_error(500, "Internal error"),
+        }
+        if store.gossip_store_save_envelope(&envelope, expires_at).is_err() {
+            return Response::json_error(500, "Storage failed");
+        }
+        let _ = store.gossip_store_mark_seen(&digest, expires_at);
+        if let Some((share, sm, sd, rm, rd)) = &share_audit {
+            let _ = store.share_record_insert(
+                &share.session_id,
+                &share.group_id,
+                sm,
+                sd,
+                rm,
+                rd,
+                request.body.as_slice(),
+            );
+        }
+    }
+    // Rebroadcast to peer nodes, as the message path does; the
+    // outcome is identical from the client's view.
+    if let Some(gossip) = &state.gossip {
+        let service = gossip.lock().unwrap();
+        let _ = service.broadcast_envelope(&envelope);
+    }
+    Response::json(202, "{\"status\":\"accepted\"}")
+}
+
+/// `GET /content/recent?for=<pubkey>&content_type=<n>&limit=<n>`
+/// — the client half of the sync path (DESIGN.md §5): envelopes
+/// from the gossip envelope store that were sent by, or
+/// addressed to, the `for` key. `for` must be the requester's
+/// own member key or one of the requester's devices — this is
+/// how a device picks up the group key shares addressed to it
+/// (content type 25, the default). Returns the serialized
+/// envelopes as hex in a JSON body, newest first.
+fn handle_content_recent(state: &ApiState, request: &Request) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let Some(for_key) = query_pubkey(request, "for") else {
+        content_reject("recent", "missing or invalid for query variable");
+        return Response::json_error(400, "Missing or invalid for");
+    };
+    let content_type: u32 = match request.query_var("content_type") {
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => {
+                content_reject("recent", "invalid content_type query variable");
+                return Response::json_error(400, "Invalid content_type");
+            }
+        },
+        None => crate::sessions::CONTENT_GROUP_KEY_SHARE,
+    };
+    let limit = query_limit(request, 100);
+    {
+        let store = state.store.lock().unwrap();
+        let allowed = for_key == requester
+            || store
+                .device_list(&requester)
+                .map(|devices| devices.iter().any(|d| d.device_pubkey == for_key))
+                .unwrap_or(false);
+        if !allowed {
+            content_reject(
+                "recent",
+                &format!(
+                    "{} may not fetch content for {} (not the member or their device)",
+                    hex_encode(&requester),
+                    hex_encode(&for_key)
+                ),
+            );
+            return Response::json_error(403, "Forbidden");
+        }
+    }
+    let stored = {
+        let store = state.store.lock().unwrap();
+        match store.gossip_store_fetch_recent_envelopes_for_user(&for_key, 1000) {
+            Ok(s) => s,
+            Err(_) => return Response::json_error(500, "Store error"),
+        }
+    };
+    let envelopes: Vec<serde_json::Value> = stored
+        .iter()
+        .filter(|s| s.content_type == content_type)
+        .take(limit as usize)
+        .map(|s| {
+            json!({
+                "content_type": s.content_type,
+                "timestamp": s.timestamp,
+                "envelope": hex_encode(&s.envelope),
+            })
+        })
+        .collect();
+    let count = envelopes.len();
+    Response::json(
+        200,
+        json!({
+            "for": hex_encode(&for_key),
+            "content_type": content_type,
+            "envelopes": envelopes,
+            "count": count,
+        })
+        .to_string(),
+    )
+}
+
+/// `GET /groups/:id/share-recipients?sender_device=<hex>` —
+/// the B4 share distribution for one group, computed by the
+/// node's own machinery ([`crate::sessions::compute_distribution`])
+/// for the requesting member as sender: every trusted device of
+/// every member (except the sender's own sending device), plus
+/// the non-member parents the visibility rule treats as `full`
+/// (their devices are in the list) and as `recipients_and_times`
+/// (member keys only — they receive metadata records, never a
+/// share). `GET /devices` deliberately answers only for the
+/// caller or their children, so a group member had no way to
+/// learn the other members' device keys; this endpoint answers
+/// exactly the distribution question, and only for a member of
+/// the group. Every refusal is logged.
+fn handle_group_share_recipients(
+    state: &ApiState,
+    request: &Request,
+    group_id_hex: &str,
+) -> Response {
+    let requester = match authenticate(state, request) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let Some(group_id) = hex_decode(group_id_hex).filter(|g| g.len() == crate::sessions::GROUP_ID_SIZE)
+    else {
+        groups_reject("share-recipients", &format!("invalid group id {group_id_hex}"));
+        return Response::json_error(400, "Invalid group id");
+    };
+    let sender_device: [u8; PUBKEY_SIZE] = match request.query_var("sender_device") {
+        Some(v) => match hex_decode_32(&v) {
+            Some(d) => d,
+            None => {
+                groups_reject("share-recipients", "invalid sender_device query variable");
+                return Response::json_error(400, "Invalid sender_device");
+            }
+        },
+        None => [0u8; PUBKEY_SIZE],
+    };
+    let now = now_epoch();
+    let store = state.store.lock().unwrap();
+    match store.group_get(&group_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            groups_reject(
+                "share-recipients",
+                &format!("unknown group {}", hex_encode(&group_id)),
+            );
+            return Response::json_error(404, "Group not found");
+        }
+        Err(_) => return Response::json_error(500, "Store error"),
+    }
+    let members = match store.conversation_members(&group_id) {
+        Ok(m) => m,
+        Err(_) => return Response::json_error(500, "Store error"),
+    };
+    if !members.contains(&requester) {
+        groups_reject(
+            "share-recipients",
+            &format!(
+                "requester {} is not a member of group {}",
+                hex_encode(&requester),
+                hex_encode(&group_id)
+            ),
+        );
+        return Response::json_error(403, "Not a group member");
+    }
+    if sender_device != [0u8; PUBKEY_SIZE] {
+        let owns = store
+            .device_list(&requester)
+            .map(|devices| devices.iter().any(|d| d.device_pubkey == sender_device))
+            .unwrap_or(false);
+        if !owns {
+            groups_reject(
+                "share-recipients",
+                &format!(
+                    "sender_device {} is not a device of requester {}",
+                    hex_encode(&sender_device),
+                    hex_encode(&requester)
+                ),
+            );
+            return Response::json_error(403, "sender_device is not the requester's device");
+        }
+    }
+    let distribution = match crate::sessions::compute_distribution(
+        &store,
+        &group_id,
+        &requester,
+        &sender_device,
+        now,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            groups_reject(
+                "share-recipients",
+                &format!("distribution failed for group {}: {e}", hex_encode(&group_id)),
+            );
+            return Response::json_error(500, "Distribution failed");
+        }
+    };
+    let devices: Vec<serde_json::Value> = distribution
+        .devices
+        .iter()
+        .map(|(member, device)| {
+            json!({
+                "member_pubkey": hex_encode(member),
+                "device_pubkey": hex_encode(device),
+            })
+        })
+        .collect();
+    Response::json(
+        200,
+        json!({
+            "group_id": hex_encode(&group_id),
+            "devices": devices,
+            "metadata_parents": distribution
+                .metadata_parents
+                .iter()
+                .map(|p| hex_encode(p))
+                .collect::<Vec<_>>(),
+            "full_parents": distribution
+                .full_parents
+                .iter()
+                .map(|p| hex_encode(p))
+                .collect::<Vec<_>>(),
         })
         .to_string(),
     )
@@ -4748,5 +5190,207 @@ mod tests {
         }
         std::fs::write(&manifest_path, manifest).unwrap();
         println!("PROOF PASS — cleanup manifest written to {manifest_path}");
+    }
+    // -- Phase C2: content path + share recipients -----------------
+
+    fn submit_content(
+        state: &ApiState,
+        member: &GroupTestMember,
+        envelope: &Envelope,
+    ) -> Response {
+        let mut req = signed_request(
+            &member.signing,
+            &member.member_pk,
+            "POST",
+            "/content/submit",
+            "",
+            now_epoch(),
+        );
+        req.body = envelope.encode_to_vec();
+        handle_request(state, &req)
+    }
+
+    fn fetch_content(
+        state: &ApiState,
+        member: &GroupTestMember,
+        for_key: &[u8; PUBKEY_SIZE],
+        content_type: u32,
+    ) -> (u16, serde_json::Value) {
+        let query = format!(
+            "for={}&content_type={}",
+            hex_encode(for_key),
+            content_type
+        );
+        let resp = handle_request(state, &signed_get(member, "/content/recent", &query));
+        let value: serde_json::Value =
+            serde_json::from_slice(&resp.body).unwrap_or(serde_json::Value::Null);
+        (resp.status, value)
+    }
+
+    #[test]
+    fn content_routes_match() {
+        assert_eq!(route("/content/submit"), Route::ContentSubmit);
+        assert_eq!(route("/content/recent"), Route::ContentRecent);
+        let gid = "ab".repeat(16);
+        assert_eq!(
+            route(&format!("/groups/{gid}/share-recipients")),
+            Route::GroupShareRecipients { group_id: gid }
+        );
+    }
+
+    #[test]
+    fn share_submit_and_fetch_round_trip() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let c = group_test_member(&state, "C");
+        let (status, created) = create_group(&state, &a, "Shares", &[&b, &c]);
+        assert_eq!(status, 200);
+        let (group_id, group_id_hex) = group_id_of(&created);
+
+        // Share-recipients: B's and C's devices are in A's
+        // distribution; A's own device is excluded when named.
+        let query = format!("sender_device={}", hex_encode(&a.device_pk));
+        let resp = handle_request(
+            &state,
+            &signed_get(
+                &a,
+                &format!("/groups/{group_id_hex}/share-recipients"),
+                &query,
+            ),
+        );
+        assert_eq!(resp.status, 200, "recipients: {}", String::from_utf8_lossy(&resp.body));
+        let dist: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let devices = dist["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2, "distribution: {dist}");
+        assert!(devices
+            .iter()
+            .any(|d| d["device_pubkey"] == hex_encode(&b.device_pk)));
+        assert!(devices
+            .iter()
+            .any(|d| d["device_pubkey"] == hex_encode(&c.device_pk)));
+
+        // A non-member may not ask.
+        let d = group_test_member(&state, "D");
+        let resp = handle_request(
+            &state,
+            &signed_get(
+                &d,
+                &format!("/groups/{group_id_hex}/share-recipients"),
+                "",
+            ),
+        );
+        assert_eq!(resp.status, 403);
+
+        // A builds a share for B's device (B4 machinery) and
+        // submits it over the content path.
+        let root_key = [0x42u8; 32];
+        let session_id = [0x24u8; 16];
+        let share_env = crate::sessions::build_share_envelope(
+            &a.ks,
+            "phone",
+            &b.member_pk,
+            &b.device_pk,
+            &group_id,
+            &session_id,
+            &root_key,
+            now_epoch(),
+        )
+        .unwrap();
+        let resp = submit_content(&state, &a, &share_env);
+        assert_eq!(
+            resp.status, 202,
+            "submit: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+
+        // Resubmission is a duplicate, not an error.
+        let resp = submit_content(&state, &a, &share_env);
+        assert_eq!(resp.status, 202);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "duplicate");
+
+        // B fetches shares addressed to B's device and gets the
+        // exact envelope back; B accepts it (B4) and holds the
+        // session state.
+        let (status, fetched) = fetch_content(&state, &b, &b.device_pk, 25);
+        assert_eq!(status, 200);
+        assert_eq!(fetched["count"], 1, "fetched: {fetched}");
+        let env_hex = fetched["envelopes"][0]["envelope"].as_str().unwrap();
+        let env_bytes = hex_decode(env_hex).unwrap();
+        assert_eq!(env_bytes, share_env.encode_to_vec());
+        let fetched_env = Envelope::decode(env_bytes.as_slice()).unwrap();
+        {
+            let store = state.store.lock().unwrap();
+            let accepted = crate::sessions::accept_share(
+                &store,
+                &fetched_env,
+                &b.ks,
+                "phone",
+                now_epoch(),
+            )
+            .unwrap();
+            assert_eq!(accepted, session_id);
+        }
+
+        // C cannot fetch content addressed to B's device.
+        let (status, _) = fetch_content(&state, &c, &b.device_pk, 25);
+        assert_eq!(status, 403);
+
+        // A share may not be submitted by someone other than its
+        // sender member.
+        let share_env_c = crate::sessions::build_share_envelope(
+            &a.ks,
+            "phone",
+            &c.member_pk,
+            &c.device_pk,
+            &group_id,
+            &[0x25u8; 16],
+            &root_key,
+            now_epoch(),
+        )
+        .unwrap();
+        let resp = submit_content(&state, &b, &share_env_c);
+        assert_eq!(resp.status, 403);
+
+        // A tampered share (envelope signature stripped) is
+        // rejected at envelope validation.
+        let mut tampered = share_env_c.clone();
+        tampered.signature = vec![0u8; 64];
+        let resp = submit_content(&state, &a, &tampered);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn metadata_submit_and_fetch() {
+        let state = empty_state();
+        let a = group_test_member(&state, "A");
+        let b = group_test_member(&state, "B");
+        let (status, created) = create_group(&state, &a, "Meta", &[&b]);
+        assert_eq!(status, 200);
+        let (group_id, _) = group_id_of(&created);
+        let envelope = {
+            let store = state.store.lock().unwrap();
+            crate::sessions::build_metadata_envelope(
+                &store,
+                &a.ks,
+                &group_id,
+                &[0x31u8; 16],
+                0,
+                now_epoch(),
+                &b.member_pk,
+            )
+            .unwrap()
+        };
+        let resp = submit_content(&state, &a, &envelope);
+        assert_eq!(
+            resp.status, 202,
+            "metadata submit: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        // B (the addressed parent) fetches it by member key.
+        let (status, fetched) = fetch_content(&state, &b, &b.member_pk, 35);
+        assert_eq!(status, 200);
+        assert_eq!(fetched["count"], 1, "fetched: {fetched}");
     }
 }
