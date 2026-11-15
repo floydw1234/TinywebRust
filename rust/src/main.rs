@@ -20,6 +20,7 @@ pub mod api;
 pub mod discovery;
 pub mod encryption;
 pub mod gossip;
+pub mod identity;
 pub mod keystore;
 pub mod proto;
 pub mod store;

@@ -24,11 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message as _;
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 use crate::proto::{
     ClientRequest, ClientRequestHeader, ClientRequestKeyWrap, ConversationList,
-    ConversationSummary, Envelope, EnvelopeHeader, Message, MessageHeader,
-    MessageRecipientKeyWrap, RecipientKeyWrap, StoredEnvelope,
+    ConversationSummary, DeviceCertificate, DeviceRevocation, Envelope, EnvelopeHeader,
+    Message, MessageHeader, MessageRecipientKeyWrap, RecipientKeyWrap, StoredEnvelope,
 };
 
 /// Ed25519 public key size (`PUBKEY_SIZE` in the C headers).
@@ -373,6 +374,70 @@ pub struct NodeTrustEntry {
     pub source: String,
 }
 
+/// Lifecycle status of a row in the `devices` table
+/// (DESIGN.md §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStatus {
+    /// The member's certificate for this device is on record
+    /// and has not been revoked.
+    Active,
+    /// The device was revoked. The row is kept as an audit
+    /// trail; the device is not trusted.
+    Revoked,
+}
+
+impl DeviceStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DeviceStatus::Active => "active",
+            DeviceStatus::Revoked => "revoked",
+        }
+    }
+
+    /// Parse a stored status. Anything that is not exactly
+    /// `active` reads as [`DeviceStatus::Revoked`] — an
+    /// unrecognized status must fail closed, never grant trust.
+    fn from_db(text: &str) -> DeviceStatus {
+        if text == DeviceStatus::Active.as_str() {
+            DeviceStatus::Active
+        } else {
+            DeviceStatus::Revoked
+        }
+    }
+}
+
+/// One row of the `devices` table: a device key a member has
+/// vouched for with a device certificate (DESIGN.md §3.1),
+/// recorded by enrollment. The certificate itself is stored
+/// (serialized `DeviceCertificate` protobuf plus its SHA-256)
+/// so trust checks can re-verify it instead of trusting the
+/// row's say-so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry {
+    /// The member who vouched for the device.
+    pub member_pubkey: [u8; PUBKEY_SIZE],
+    /// The device's public key.
+    pub device_pubkey: [u8; PUBKEY_SIZE],
+    /// The device label from its certificate.
+    pub label: String,
+    /// Serialized `DeviceCertificate` protobuf, as stored.
+    pub cert: Vec<u8>,
+    /// SHA-256 of `cert`.
+    pub cert_hash: [u8; 32],
+    /// Active or revoked (revocation keeps the row).
+    pub status: DeviceStatus,
+    /// Certificate `issued_at` (epoch seconds).
+    pub issued_at: u64,
+    /// Certificate `expires_at` (epoch seconds; 0 = never).
+    pub expires_at: u64,
+    /// When the device was revoked, if it was.
+    pub revoked_at: Option<u64>,
+    /// Row creation time (epoch seconds).
+    pub created_at: u64,
+    /// Last row modification (epoch seconds).
+    pub updated_at: u64,
+}
+
 /// One row of the C `nodes` table (`nodes_get_by_id` out-params).
 /// Nullable text columns surface as empty strings, as in C.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +541,7 @@ const CREATE_IDX_PEERS_LAST_SEEN: &str =
 const CREATE_IDX_PEERS_PUBKEY: &str =
     "CREATE INDEX IF NOT EXISTS idx_gossip_peers_node_pubkey ON gossip_peers(node_pubkey);";
 const CREATE_NODE_TRUST: &str = "CREATE TABLE IF NOT EXISTS node_trust ( node_pubkey BLOB PRIMARY KEY, hostname TEXT, trusted_at INTEGER NOT NULL, source TEXT NOT NULL DEFAULT '');";
+const CREATE_DEVICES: &str = "CREATE TABLE IF NOT EXISTS devices ( member_pubkey BLOB NOT NULL, device_pubkey BLOB NOT NULL, label TEXT NOT NULL DEFAULT '', cert BLOB NOT NULL, cert_hash BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'active', issued_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, revoked_at INTEGER, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (member_pubkey, device_pubkey));";
 
 /// Statements of `gossip_store_init`, in C execution order.
 const GOSSIP_SCHEMA: &[&str] = &[
@@ -1765,6 +1831,174 @@ impl Store {
         Ok(out)
     }
 
+    // -- devices (DESIGN.md §3.1) ------------------------------------
+
+    /// Create the `devices` table. Every device operation calls
+    /// this first, like the C `ensure_initialized`.
+    pub fn devices_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_DEVICES)?;
+        Ok(())
+    }
+
+    /// Record a member's device certificate (enrollment's write
+    /// path). The certificate is verified first — signature and
+    /// expiry at `now` — and an invalid one is rejected (the
+    /// `identity` module logs the reason) and never stored.
+    ///
+    /// Re-adding a certificate for an already-known
+    /// (member, device) pair replaces the stored certificate
+    /// and returns the device to `active`: a fresh vouch from
+    /// the member key is exactly what re-issuance means. The
+    /// original `created_at` is kept.
+    pub fn device_add(&self, cert: &DeviceCertificate, now: u64) -> Result<()> {
+        self.devices_init()?;
+        crate::identity::verify_device_certificate(cert, now).map_err(|e| {
+            invalid(&format!("device certificate rejected: {e}"))
+        })?;
+        // Verification has established both pubkeys are 32 bytes.
+        let cert_bytes = cert.encode_to_vec();
+        let cert_hash: [u8; 32] = Sha256::digest(&cert_bytes).into();
+        self.conn.execute(
+            "INSERT INTO devices (member_pubkey, device_pubkey, label, cert, cert_hash, status, issued_at, expires_at, revoked_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?) ON CONFLICT(member_pubkey, device_pubkey) DO UPDATE SET label=excluded.label, cert=excluded.cert, cert_hash=excluded.cert_hash, status='active', issued_at=excluded.issued_at, expires_at=excluded.expires_at, revoked_at=NULL, updated_at=excluded.updated_at",
+            params![
+                &cert.member_pubkey[..],
+                &cert.device_pubkey[..],
+                cert.label,
+                cert_bytes,
+                &cert_hash[..],
+                cert.issued_at as i64,
+                cert.expires_at as i64,
+                now as i64,
+                now as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded device for (member, device), `Ok(None)` when
+    /// the pair was never enrolled.
+    pub fn device_get(
+        &self,
+        member_pubkey: &[u8; PUBKEY_SIZE],
+        device_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<Option<DeviceEntry>> {
+        self.devices_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT member_pubkey, device_pubkey, label, cert, cert_hash, status, issued_at, expires_at, revoked_at, created_at, updated_at FROM devices WHERE member_pubkey = ? AND device_pubkey = ?",
+        )?;
+        let mut rows = stmt.query(params![&member_pubkey[..], &device_pubkey[..]])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(device_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All devices recorded for a member, oldest certificate
+    /// first, including revoked ones (the audit trail).
+    pub fn device_list(&self, member_pubkey: &[u8; PUBKEY_SIZE]) -> Result<Vec<DeviceEntry>> {
+        self.devices_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT member_pubkey, device_pubkey, label, cert, cert_hash, status, issued_at, expires_at, revoked_at, created_at, updated_at FROM devices WHERE member_pubkey = ? ORDER BY issued_at ASC, device_pubkey ASC",
+        )?;
+        let rows = stmt.query_map(params![&member_pubkey[..]], device_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Revoke a device: a status flip to `revoked`, never a
+    /// delete, so the enrollment record stays auditable.
+    /// Returns whether an active device was actually revoked
+    /// (unknown pairs and already-revoked devices report
+    /// `false`).
+    pub fn device_revoke(
+        &self,
+        member_pubkey: &[u8; PUBKEY_SIZE],
+        device_pubkey: &[u8; PUBKEY_SIZE],
+        revoked_at: u64,
+    ) -> Result<bool> {
+        self.devices_init()?;
+        let changed = self.conn.execute(
+            "UPDATE devices SET status='revoked', revoked_at=?, updated_at=? WHERE member_pubkey=? AND device_pubkey=? AND status='active'",
+            params![
+                revoked_at as i64,
+                revoked_at as i64,
+                &member_pubkey[..],
+                &device_pubkey[..]
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Apply a signed device revocation (the gossiped record):
+    /// the member-key signature is verified first (rejections
+    /// are logged by the `identity` module), then the device is
+    /// revoked at the revocation's `revoked_at`. Returns
+    /// whether an active device was revoked.
+    pub fn device_apply_revocation(&self, revocation: &DeviceRevocation) -> Result<bool> {
+        crate::identity::verify_device_revocation(revocation).map_err(|e| {
+            invalid(&format!("device revocation rejected: {e}"))
+        })?;
+        // Verification has established both pubkeys are 32 bytes.
+        let member_pubkey: [u8; PUBKEY_SIZE] = revocation
+            .member_pubkey
+            .as_slice()
+            .try_into()
+            .expect("verified length");
+        let device_pubkey: [u8; PUBKEY_SIZE] = revocation
+            .device_pubkey
+            .as_slice()
+            .try_into()
+            .expect("verified length");
+        self.device_revoke(&member_pubkey, &device_pubkey, revocation.revoked_at)
+    }
+
+    /// Is this device currently trusted for this member? True
+    /// only when a device row exists, is `active`, and its
+    /// stored certificate still verifies at `now` — signature
+    /// and expiry are re-checked on every call, so a tampered
+    /// row or a lapsed certificate stops trusting (and the
+    /// failed verification is logged by the `identity`
+    /// module). This is the helper ingest/API paths ask before
+    /// treating a device key as its member.
+    pub fn device_is_trusted(
+        &self,
+        member_pubkey: &[u8; PUBKEY_SIZE],
+        device_pubkey: &[u8; PUBKEY_SIZE],
+        now: u64,
+    ) -> Result<bool> {
+        let Some(entry) = self.device_get(member_pubkey, device_pubkey)? else {
+            return Ok(false);
+        };
+        if entry.status != DeviceStatus::Active {
+            return Ok(false);
+        }
+        let cert = match DeviceCertificate::decode(entry.cert.as_slice()) {
+            Ok(cert) => cert,
+            Err(e) => {
+                eprintln!(
+                    "identity: stored device certificate member={} device={} does not decode: {e}",
+                    hex_encode_pubkey(member_pubkey),
+                    hex_encode_pubkey(device_pubkey)
+                );
+                return Ok(false);
+            }
+        };
+        // The stored certificate must be for exactly this pair;
+        // a row whose certificate names other keys is corrupt.
+        if cert.member_pubkey != member_pubkey[..] || cert.device_pubkey != device_pubkey[..] {
+            eprintln!(
+                "identity: stored device certificate member={} device={} names different keys",
+                hex_encode_pubkey(member_pubkey),
+                hex_encode_pubkey(device_pubkey)
+            );
+            return Ok(false);
+        }
+        Ok(crate::identity::verify_device_certificate(&cert, now).is_ok())
+    }
+
     /// Delete a peer by hostname; returns whether a row was removed.
     /// The C package has no remove operation (its header lists only
     /// add/touch/list/get); this is provided because the porting
@@ -1921,6 +2155,38 @@ fn trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeTrustEntry> {
         hostname: row.get(1)?,
         trusted_at: row.get::<_, i64>(2)? as u64,
         source: row.get(3)?,
+    })
+}
+
+fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceEntry> {
+    let member_blob: Vec<u8> = row.get(0)?;
+    let device_blob: Vec<u8> = row.get(1)?;
+    let hash_blob: Vec<u8> = row.get(4)?;
+    let mut member_pubkey = [0u8; PUBKEY_SIZE];
+    if member_blob.len() == PUBKEY_SIZE {
+        member_pubkey.copy_from_slice(&member_blob);
+    }
+    let mut device_pubkey = [0u8; PUBKEY_SIZE];
+    if device_blob.len() == PUBKEY_SIZE {
+        device_pubkey.copy_from_slice(&device_blob);
+    }
+    let mut cert_hash = [0u8; 32];
+    if hash_blob.len() == 32 {
+        cert_hash.copy_from_slice(&hash_blob);
+    }
+    let status_text: String = row.get(5)?;
+    Ok(DeviceEntry {
+        member_pubkey,
+        device_pubkey,
+        label: row.get(2)?,
+        cert: row.get(3)?,
+        cert_hash,
+        status: DeviceStatus::from_db(&status_text),
+        issued_at: row.get::<_, i64>(6)? as u64,
+        expires_at: row.get::<_, i64>(7)? as u64,
+        revoked_at: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        created_at: row.get::<_, i64>(9)? as u64,
+        updated_at: row.get::<_, i64>(10)? as u64,
     })
 }
 
@@ -2528,6 +2794,205 @@ mod tests {
             .gossip_peers_add_or_update("peer-node", 9000, 0, None)
             .unwrap();
         assert!(store.node_trust_is_trusted(&key).unwrap());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// A member keystore with a member key and one device key
+    /// labelled `label`, plus the certificate issued for that
+    /// device at `issued_at` with no expiry.
+    fn member_with_cert(
+        label: &str,
+        issued_at: u64,
+    ) -> (
+        crate::keystore::MemberKeystore,
+        DeviceCertificate,
+        [u8; PUBKEY_SIZE],
+        [u8; PUBKEY_SIZE],
+    ) {
+        let mut member = crate::keystore::MemberKeystore::new();
+        member.generate_member_key().unwrap();
+        let device_pubkey = member.add_device_key(label).unwrap();
+        let cert = crate::identity::issue_device_certificate(&member, label, issued_at, 0).unwrap();
+        let member_pubkey = member.member_public_key().unwrap();
+        (member, cert, member_pubkey, device_pubkey)
+    }
+
+    #[test]
+    fn device_add_get_list_and_trust() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (_member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+
+        // Unknown pairs are not trusted and not found.
+        assert!(!store.device_is_trusted(&member_pk, &device_pk, NOW).unwrap());
+        assert!(store.device_get(&member_pk, &device_pk).unwrap().is_none());
+        assert!(store.device_list(&member_pk).unwrap().is_empty());
+
+        store.device_add(&cert, NOW).unwrap();
+        assert!(store.device_is_trusted(&member_pk, &device_pk, NOW).unwrap());
+        // No-expiry certificates stay trusted.
+        assert!(store
+            .device_is_trusted(&member_pk, &device_pk, NOW + 10_000_000)
+            .unwrap());
+        // ... but only for the member who vouched for the device.
+        assert!(!store
+            .device_is_trusted(&[0xEE; 32], &device_pk, NOW)
+            .unwrap());
+
+        let entry = store.device_get(&member_pk, &device_pk).unwrap().unwrap();
+        assert_eq!(entry.label, "phone");
+        assert_eq!(entry.status, DeviceStatus::Active);
+        assert_eq!(entry.issued_at, NOW);
+        assert_eq!(entry.expires_at, 0);
+        assert_eq!(entry.revoked_at, None);
+        let cert_bytes = cert.encode_to_vec();
+        assert_eq!(entry.cert, cert_bytes);
+        let expected_hash: [u8; 32] = Sha256::digest(&cert_bytes).into();
+        assert_eq!(entry.cert_hash, expected_hash);
+
+        let list = store.device_list(&member_pk).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], entry);
+    }
+
+    #[test]
+    fn device_add_rejects_tampered_and_expired_certificates() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+
+        // A certificate whose label was changed after signing
+        // does not verify and is never stored.
+        let mut tampered = cert.clone();
+        tampered.label = "forged".to_string();
+        assert!(store.device_add(&tampered, NOW).is_err());
+        assert!(store.device_get(&member_pk, &device_pk).unwrap().is_none());
+
+        // An already-expired certificate is rejected at add
+        // time, not stored to fail later.
+        let expired = crate::identity::create_device_certificate(
+            member.member_keystore(),
+            &device_pk,
+            "phone",
+            NOW - 100,
+            NOW - 50,
+        )
+        .unwrap();
+        assert!(store.device_add(&expired, NOW).is_err());
+        assert!(store.device_get(&member_pk, &device_pk).unwrap().is_none());
+        assert!(!store.device_is_trusted(&member_pk, &device_pk, NOW).unwrap());
+    }
+
+    #[test]
+    fn device_revoke_flips_status_and_keeps_the_row() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (_member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+        store.device_add(&cert, NOW).unwrap();
+
+        assert!(store.device_revoke(&member_pk, &device_pk, NOW + 5).unwrap());
+        assert!(!store.device_is_trusted(&member_pk, &device_pk, NOW + 6).unwrap());
+        // The row remains as an audit trail.
+        let entry = store.device_get(&member_pk, &device_pk).unwrap().unwrap();
+        assert_eq!(entry.status, DeviceStatus::Revoked);
+        assert_eq!(entry.revoked_at, Some(NOW + 5));
+        assert_eq!(store.device_list(&member_pk).unwrap().len(), 1);
+        // Revoking again (or an unknown pair) changes nothing.
+        assert!(!store.device_revoke(&member_pk, &device_pk, NOW + 7).unwrap());
+        assert!(!store.device_revoke(&member_pk, &[0x99; 32], NOW + 7).unwrap());
+
+        // A fresh certificate from the member re-activates the
+        // device (re-issuance).
+        store.device_add(&cert, NOW + 10).unwrap();
+        let entry = store.device_get(&member_pk, &device_pk).unwrap().unwrap();
+        assert_eq!(entry.status, DeviceStatus::Active);
+        assert_eq!(entry.revoked_at, None);
+        assert!(store.device_is_trusted(&member_pk, &device_pk, NOW + 10).unwrap());
+    }
+
+    #[test]
+    fn device_apply_revocation_verifies_the_signature() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+        store.device_add(&cert, NOW).unwrap();
+
+        let revocation = crate::identity::create_device_revocation(
+            member.member_keystore(),
+            &device_pk,
+            NOW + 5,
+            "lost",
+        )
+        .unwrap();
+        // A revocation whose reason was altered after signing
+        // is rejected and changes nothing.
+        let mut forged = revocation.clone();
+        forged.reason = "forged".to_string();
+        assert!(store.device_apply_revocation(&forged).is_err());
+        assert!(store.device_is_trusted(&member_pk, &device_pk, NOW + 6).unwrap());
+
+        assert!(store.device_apply_revocation(&revocation).unwrap());
+        assert!(!store.device_is_trusted(&member_pk, &device_pk, NOW + 6).unwrap());
+        let entry = store.device_get(&member_pk, &device_pk).unwrap().unwrap();
+        assert_eq!(entry.status, DeviceStatus::Revoked);
+        assert_eq!(entry.revoked_at, Some(NOW + 5));
+    }
+
+    #[test]
+    fn member_with_two_devices_has_independent_trust() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let mut member = crate::keystore::MemberKeystore::new();
+        member.generate_member_key().unwrap();
+        let member_pk = member.member_public_key().unwrap();
+        let phone = member.add_device_key("phone").unwrap();
+        let laptop = member.add_device_key("laptop").unwrap();
+        for label in ["phone", "laptop"] {
+            let cert =
+                crate::identity::issue_device_certificate(&member, label, NOW, 0).unwrap();
+            store.device_add(&cert, NOW).unwrap();
+        }
+        assert!(store.device_is_trusted(&member_pk, &phone, NOW).unwrap());
+        assert!(store.device_is_trusted(&member_pk, &laptop, NOW).unwrap());
+        assert_eq!(store.device_list(&member_pk).unwrap().len(), 2);
+
+        // Revoking one device leaves the other trusted.
+        assert!(store.device_revoke(&member_pk, &phone, NOW + 1).unwrap());
+        assert!(!store.device_is_trusted(&member_pk, &phone, NOW + 1).unwrap());
+        assert!(store.device_is_trusted(&member_pk, &laptop, NOW + 1).unwrap());
+        let list = store.device_list(&member_pk).unwrap();
+        assert_eq!(list.len(), 2);
+        let statuses: Vec<DeviceStatus> = list.iter().map(|d| d.status).collect();
+        assert!(statuses.contains(&DeviceStatus::Revoked));
+        assert!(statuses.contains(&DeviceStatus::Active));
+    }
+
+    #[test]
+    fn devices_survive_reopen() {
+        const NOW: u64 = 1_700_000_000;
+        let path = std::env::temp_dir().join(format!(
+            "tinyweb_store_devices_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (_member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+        {
+            let store = Store::open(&path).unwrap();
+            store.init_schema().unwrap();
+            store.device_add(&cert, NOW).unwrap();
+            assert!(store.device_revoke(&member_pk, &device_pk, NOW + 5).unwrap());
+        }
+        // "Restart": the enrollment record, including the
+        // revocation, is still there and still decisive.
+        let store = Store::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let entry = store.device_get(&member_pk, &device_pk).unwrap().unwrap();
+        assert_eq!(entry.status, DeviceStatus::Revoked);
+        assert_eq!(entry.revoked_at, Some(NOW + 5));
+        assert!(!store.device_is_trusted(&member_pk, &device_pk, NOW + 6).unwrap());
         drop(store);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

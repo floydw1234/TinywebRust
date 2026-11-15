@@ -35,6 +35,16 @@
 //! destroys the mutex, making the keystore unusable afterwards).
 //! The Rust port has no equivalent failure mode: [`Keystore`] is a
 //! plain value, and cleanup only zeroizes the key material.
+//!
+//! The C design has exactly one key per process; the integrated
+//! design (DESIGN.md §3.1) has three kinds — the **node key**
+//! (this box on the gossip network), the **member key** (a
+//! person), and a **device key** per phone/laptop. [`Keystore`]
+//! remains the single-keypair primitive and the node key's home;
+//! [`MemberKeystore`] holds a member key plus that member's
+//! device keys, all in the same passphrase-encrypted file format.
+//! Signing statements *about* device keys (certificates,
+//! revocations) lives in the `identity` module.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -79,6 +89,27 @@ pub const PWHASH_MEMLIMIT_INTERACTIVE: usize = 67_108_864;
 /// (64-byte secret key + 16-byte MAC).
 pub const KEY_FILE_SIZE: usize =
     PWHASH_SALT_SIZE + SECRETBOX_NONCE_SIZE + SIGN_SECRET_SIZE + SECRETBOX_MAC_SIZE;
+
+/// Which of the three identity tiers a keypair belongs to
+/// (DESIGN.md §3.1). The tiers share one key format and one file
+/// format; the kind records what the key *means* — which
+/// statements it may sign and how it is revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// The home node's key: identifies this box on the gossip
+    /// network. Held by the node process (the [`Keystore`]
+    /// singleton above).
+    Node,
+    /// A person's key: their identity across every feature.
+    /// Signs registrations, role changes, and device
+    /// certificates.
+    Member,
+    /// One phone/laptop's key: signs that device's envelope
+    /// submissions and API auth. Trusted via a device
+    /// certificate from its member key, and revocable without
+    /// changing who the member is.
+    Device,
+}
 
 /// Error type for all keystore operations.
 #[derive(Debug)]
@@ -261,6 +292,7 @@ pub(crate) fn secretbox_open_easy(
 /// (the C code zeroizes only in `keystore_cleanup`).
 #[derive(Clone)]
 pub struct Keystore {
+    kind: KeyKind,
     sign_public_key: [u8; SIGN_PUBKEY_SIZE],
     sign_secret_key: [u8; SIGN_SECRET_SIZE],
     keypair_loaded: bool,
@@ -289,13 +321,29 @@ impl fmt::Debug for Keystore {
 }
 
 impl Keystore {
-    /// A keystore with no keypair loaded.
+    /// A keystore with no keypair loaded. The kind is
+    /// [`KeyKind::Node`]: this type's original job, and still
+    /// the node process's key.
     pub fn new() -> Self {
+        Self::with_kind(KeyKind::Node)
+    }
+
+    /// A keystore with no keypair loaded, tagged with the given
+    /// identity tier (DESIGN.md §3.1). The kind is metadata
+    /// only — key generation, file format, and conversions are
+    /// identical for every tier.
+    pub fn with_kind(kind: KeyKind) -> Self {
         Keystore {
+            kind,
             sign_public_key: [0u8; SIGN_PUBKEY_SIZE],
             sign_secret_key: [0u8; SIGN_SECRET_SIZE],
             keypair_loaded: false,
         }
+    }
+
+    /// Which identity tier this keystore's keypair belongs to.
+    pub fn kind(&self) -> KeyKind {
+        self.kind
     }
 
     /// Generate a new Ed25519 keypair (C `keystore_generate_keypair`,
@@ -470,6 +518,243 @@ impl Keystore {
         self.sign_secret_key.zeroize();
         self.sign_public_key.zeroize();
         self.keypair_loaded = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Member keystore (DESIGN.md §3.1): a member key plus its device keys
+// ---------------------------------------------------------------------------
+
+/// Filename of the member key inside a [`MemberKeystore`]
+/// directory.
+pub const MEMBER_KEY_FILE: &str = "member.key";
+/// Subdirectory of a [`MemberKeystore`] directory holding the
+/// device key files, one `<label>.key` per device.
+pub const DEVICE_KEYS_DIR: &str = "devices";
+/// Maximum length of a device label. Labels double as filenames
+/// (see [`MemberKeystore::save`]), so they are restricted to
+/// `[A-Za-z0-9._-]` by [`MemberKeystore::add_device_key`].
+pub const MAX_DEVICE_LABEL_LEN: usize = 64;
+
+/// One device key held by a [`MemberKeystore`]: the label the
+/// member gave the device and its public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceKeyInfo {
+    /// The device label (unique within the member keystore).
+    pub label: String,
+    /// The device's Ed25519 public key.
+    pub public_key: [u8; SIGN_PUBKEY_SIZE],
+}
+
+struct DeviceKey {
+    label: String,
+    public_key: [u8; SIGN_PUBKEY_SIZE],
+    keystore: Keystore,
+}
+
+/// A member's keys (DESIGN.md §3.1): the member keypair plus one
+/// device keypair per phone/laptop the member uses.
+///
+/// The member key is the person's identity; it is created once
+/// and (per the enrollment design) rooted on their first device.
+/// Device keys are cheap and revocable: losing a phone means
+/// revoking that device key (the `identity` module's
+/// certificates/revocations, recorded in the store's `devices`
+/// table), never changing who the member is.
+///
+/// On disk the keystore is a directory: `member.key` plus
+/// `devices/<label>.key`, every file the same 120-byte
+/// passphrase-encrypted format as [`Keystore::save_private_key`],
+/// all under one passphrase.
+pub struct MemberKeystore {
+    member: Keystore,
+    devices: Vec<DeviceKey>,
+}
+
+impl Default for MemberKeystore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for MemberKeystore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never print key material.
+        f.debug_struct("MemberKeystore")
+            .field("member_loaded", &self.member.is_keypair_loaded())
+            .field(
+                "device_labels",
+                &self.devices.iter().map(|d| &d.label).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemberKeystore {
+    /// An empty member keystore: no member key, no device keys.
+    pub fn new() -> Self {
+        MemberKeystore {
+            member: Keystore::with_kind(KeyKind::Member),
+            devices: Vec::new(),
+        }
+    }
+
+    /// Generate the member keypair, replacing any current one.
+    /// Replacing the member key orphans every certificate it
+    /// previously signed (they verify against the old key), so
+    /// this is a setup/recovery operation, not a routine one.
+    pub fn generate_member_key(&mut self) -> Result<()> {
+        self.member.generate_keypair()
+    }
+
+    /// The member keypair's keystore (kind [`KeyKind::Member`]),
+    /// e.g. for the `identity` module to sign device
+    /// certificates with.
+    pub fn member_keystore(&self) -> &Keystore {
+        &self.member
+    }
+
+    /// The member's Ed25519 public key — their identity across
+    /// every feature.
+    pub fn member_public_key(&self) -> Result<[u8; SIGN_PUBKEY_SIZE]> {
+        self.member.get_public_key()
+    }
+
+    /// Generate a new device keypair under `label` and return
+    /// its public key. Labels are unique per member and double
+    /// as filenames on save, so they must be 1–64 characters of
+    /// `[A-Za-z0-9._-]` (and not `.` or `..`).
+    pub fn add_device_key(&mut self, label: &str) -> Result<[u8; SIGN_PUBKEY_SIZE]> {
+        validate_device_label(label)?;
+        if self.devices.iter().any(|d| d.label == label) {
+            return Err(invalid("device label already in use"));
+        }
+        let mut keystore = Keystore::with_kind(KeyKind::Device);
+        keystore.generate_keypair()?;
+        let public_key = keystore.get_public_key()?;
+        self.devices.push(DeviceKey {
+            label: label.to_string(),
+            public_key,
+            keystore,
+        });
+        Ok(public_key)
+    }
+
+    /// All device keys, in the order they were added (or, after
+    /// a load, in filename order).
+    pub fn device_keys(&self) -> Vec<DeviceKeyInfo> {
+        self.devices
+            .iter()
+            .map(|d| DeviceKeyInfo {
+                label: d.label.clone(),
+                public_key: d.public_key,
+            })
+            .collect()
+    }
+
+    /// The public key of the device labelled `label`, if any.
+    pub fn device_public_key(&self, label: &str) -> Option<[u8; SIGN_PUBKEY_SIZE]> {
+        self.devices
+            .iter()
+            .find(|d| d.label == label)
+            .map(|d| d.public_key)
+    }
+
+    /// The keystore of the device labelled `label`, if any
+    /// (kind [`KeyKind::Device`]).
+    pub fn device_keystore(&self, label: &str) -> Option<&Keystore> {
+        self.devices
+            .iter()
+            .find(|d| d.label == label)
+            .map(|d| &d.keystore)
+    }
+
+    /// Save the member key and every device key under `dir`,
+    /// each passphrase-encrypted in the standard key-file
+    /// format: `dir/member.key` and `dir/devices/<label>.key`.
+    /// The member key must be loaded.
+    pub fn save(&self, dir: impl AsRef<Path>, passphrase: &str) -> Result<()> {
+        if !self.member.is_keypair_loaded() {
+            return Err(Error::NotLoaded);
+        }
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        self.member
+            .save_private_key(dir.join(MEMBER_KEY_FILE), passphrase)?;
+        if !self.devices.is_empty() {
+            let devices_dir = dir.join(DEVICE_KEYS_DIR);
+            std::fs::create_dir_all(&devices_dir)?;
+            for device in &self.devices {
+                device
+                    .keystore
+                    .save_private_key(devices_dir.join(format!("{}.key", device.label)), passphrase)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a member keystore saved by [`MemberKeystore::save`].
+    /// Device files are read in filename order; a file whose
+    /// stem is not a valid device label fails the whole load,
+    /// as does any file that does not decrypt under
+    /// `passphrase`.
+    pub fn load(dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
+        let dir = dir.as_ref();
+        let mut member = Keystore::with_kind(KeyKind::Member);
+        member.load_private_key(dir.join(MEMBER_KEY_FILE), passphrase)?;
+        let mut loaded = MemberKeystore {
+            member,
+            devices: Vec::new(),
+        };
+        let devices_dir = dir.join(DEVICE_KEYS_DIR);
+        if devices_dir.is_dir() {
+            let mut paths: Vec<PathBuf> = Vec::new();
+            for entry in std::fs::read_dir(&devices_dir)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "key") {
+                    paths.push(path);
+                }
+            }
+            paths.sort();
+            for path in paths {
+                let label = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                validate_device_label(&label)?;
+                let mut keystore = Keystore::with_kind(KeyKind::Device);
+                keystore.load_private_key(&path, passphrase)?;
+                let public_key = keystore.get_public_key()?;
+                loaded.devices.push(DeviceKey {
+                    label,
+                    public_key,
+                    keystore,
+                });
+            }
+        }
+        Ok(loaded)
+    }
+}
+
+/// Device labels double as filenames in
+/// [`MemberKeystore::save`], so they are kept to a conservative
+/// alphabet: 1–[`MAX_DEVICE_LABEL_LEN`] characters of
+/// `[A-Za-z0-9._-]`, and never `.` or `..`.
+fn validate_device_label(label: &str) -> Result<()> {
+    let ok = !label.is_empty()
+        && label.len() <= MAX_DEVICE_LABEL_LEN
+        && label != "."
+        && label != ".."
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(
+            "device label must be 1-64 characters of [A-Za-z0-9._-] and not . or ..",
+        ))
     }
 }
 
@@ -802,5 +1087,118 @@ mod tests {
         assert_eq!(ks.get_public_key().expect("pk"), hex_array::<32>(SIGN2_PK));
         assert!(Keystore::new().load_user_key(&base, "mallory").is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn key_kinds_are_tagged() {
+        assert_eq!(Keystore::new().kind(), KeyKind::Node);
+        let mut member = MemberKeystore::new();
+        assert_eq!(member.member_keystore().kind(), KeyKind::Member);
+        assert!(matches!(
+            member.member_public_key(),
+            Err(Error::NotLoaded)
+        ));
+        member.generate_member_key().expect("member key");
+        member.add_device_key("phone").expect("device key");
+        assert_eq!(
+            member.device_keystore("phone").expect("device").kind(),
+            KeyKind::Device
+        );
+    }
+
+    #[test]
+    fn member_keystore_holds_member_plus_two_devices() {
+        let mut member = MemberKeystore::new();
+        member.generate_member_key().expect("member key");
+        let phone = member.add_device_key("phone").expect("phone");
+        let laptop = member.add_device_key("laptop").expect("laptop");
+        assert_ne!(phone, laptop);
+        assert_ne!(phone, member.member_public_key().expect("member pk"));
+
+        let listed = member.device_keys();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].label, "phone");
+        assert_eq!(listed[0].public_key, phone);
+        assert_eq!(listed[1].label, "laptop");
+        assert_eq!(member.device_public_key("laptop"), Some(laptop));
+        assert_eq!(member.device_public_key("tablet"), None);
+
+        // Duplicate and unsafe labels are refused.
+        assert!(matches!(
+            member.add_device_key("phone"),
+            Err(Error::InvalidArgument(_))
+        ));
+        for bad in ["", ".", "..", "a/b", "a b", "ünïcode", &"x".repeat(65)] {
+            assert!(
+                matches!(member.add_device_key(bad), Err(Error::InvalidArgument(_))),
+                "label {bad:?} must be rejected"
+            );
+        }
+        assert_eq!(member.device_keys().len(), 2);
+    }
+
+    #[test]
+    fn member_keystore_save_load_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "tinyweb-keystore-test-{}-memberks",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut member = MemberKeystore::new();
+        // Saving before a member key exists fails.
+        assert!(matches!(
+            member.save(&dir, "pw"),
+            Err(Error::NotLoaded)
+        ));
+        member.generate_member_key().expect("member key");
+        let member_pk = member.member_public_key().expect("member pk");
+        let member_secret = member
+            .member_keystore()
+            .get_private_key()
+            .expect("member secret");
+        let phone = member.add_device_key("phone").expect("phone");
+        let laptop = member.add_device_key("laptop").expect("laptop");
+        member.save(&dir, "correct horse").expect("save");
+
+        // The on-disk layout is one standard-format key file
+        // per key.
+        assert_eq!(
+            std::fs::read(dir.join(MEMBER_KEY_FILE)).expect("member file").len(),
+            KEY_FILE_SIZE
+        );
+        assert_eq!(
+            std::fs::read(dir.join(DEVICE_KEYS_DIR).join("phone.key"))
+                .expect("phone file")
+                .len(),
+            KEY_FILE_SIZE
+        );
+
+        // Wrong passphrase loads nothing.
+        assert!(MemberKeystore::load(&dir, "wrong").is_err());
+
+        let loaded = MemberKeystore::load(&dir, "correct horse").expect("load");
+        assert_eq!(loaded.member_public_key().expect("member pk"), member_pk);
+        assert_eq!(
+            loaded
+                .member_keystore()
+                .get_private_key()
+                .expect("member secret"),
+            member_secret
+        );
+        assert_eq!(loaded.member_keystore().kind(), KeyKind::Member);
+        let devices = loaded.device_keys();
+        assert_eq!(devices.len(), 2);
+        // Load order is filename order: laptop before phone.
+        assert_eq!(devices[0].label, "laptop");
+        assert_eq!(devices[0].public_key, laptop);
+        assert_eq!(devices[1].label, "phone");
+        assert_eq!(devices[1].public_key, phone);
+        assert_eq!(
+            loaded.device_keystore("phone").expect("device").kind(),
+            KeyKind::Device
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

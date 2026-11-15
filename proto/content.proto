@@ -19,6 +19,32 @@ message RoleAssignment {
   string reason = 3;               // Optional reason
 }
 
+// Device certificate: the member key (field 1) vouches that the
+// device key (field 2) belongs to that member. The signature
+// covers a domain-separated digest ("TWDEVCERT") of fields 1-5,
+// so the record is self-verifying wherever it is stored or
+// gossiped (DESIGN.md §3.1).
+message DeviceCertificate {
+  bytes member_pubkey = 1;         // 32 bytes Ed25519
+  bytes device_pubkey = 2;         // 32 bytes Ed25519
+  string label = 3;                // e.g. "Mom's iPhone"
+  uint64 issued_at = 4;            // Seconds since epoch
+  uint64 expires_at = 5;           // 0 = no expiry
+  bytes signature = 6;             // 64 bytes Ed25519, by the member key
+}
+
+// Device revocation: the member key withdraws a device
+// certificate previously issued for (member_pubkey,
+// device_pubkey). The signature covers a domain-separated
+// digest ("TWDEVREVOKE") of fields 1-4.
+message DeviceRevocation {
+  bytes member_pubkey = 1;         // 32 bytes Ed25519
+  bytes device_pubkey = 2;         // 32 bytes Ed25519
+  uint64 revoked_at = 3;           // Seconds since epoch
+  string reason = 4;               // Optional: "lost", "replaced", ...
+  bytes signature = 5;             // 64 bytes Ed25519, by the member key
+}
+
 // --- Communication ---
 message DirectMessage {
   string text = 1;
