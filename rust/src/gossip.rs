@@ -17,8 +17,8 @@
 //!   match what a C node sends.
 //! * [`IngestPipeline`] is the `main.c` receive pipeline, exposed
 //!   as handlers a later `main.rs` can install exactly like
-//!   `main.c` installs its C callbacks: validate, whitelist check
-//!   against the `gossip_peers` store, dedup via the store seen
+//!   `main.c` installs its C callbacks: validate, trust check
+//!   against the `node_trust` store, dedup via the store seen
 //!   set, store, discover-peer-from-source, node-registration
 //!   handling, content dispatch, rebroadcast to other peers.
 //! * [`EnvelopeDispatcher`] is the content-type handler registry
@@ -103,7 +103,7 @@ pub enum Error {
     PeerTableFull,
     /// Envelope/message validation failed (ingest rejection).
     Validation(String),
-    /// Sender public key is not in the `gossip_peers` whitelist.
+    /// Sender public key is not in the `node_trust` whitelist.
     Unauthorized,
     /// Persistence failure from the store layer.
     Store(store::Error),
@@ -122,7 +122,7 @@ impl fmt::Display for Error {
             Error::NotRunning => write!(f, "gossip service is not running"),
             Error::PeerTableFull => write!(f, "peer table full ({GOSSIP_MAX_PEERS} peers)"),
             Error::Validation(m) => write!(f, "validation failed: {m}"),
-            Error::Unauthorized => write!(f, "sender not in gossip_peers whitelist"),
+            Error::Unauthorized => write!(f, "sender not in node_trust whitelist"),
             Error::Store(e) => write!(f, "store error: {e}"),
             Error::NoHandler(ct) => write!(f, "no handler for content type {ct}"),
             Error::Handler(m) => write!(f, "content handler failed: {m}"),
@@ -172,6 +172,19 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Lowercase hex of a key, for ingest log lines.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Source label for ingest log lines (`local` when the
+/// datagram did not come from the network).
+fn source_label(source: Option<SocketAddr>) -> String {
+    source
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 /// One peer-list entry (C `GossipPeer`). Times are epoch seconds
@@ -588,7 +601,7 @@ impl GossipService {
     }
 
     /// A service with the `main.c` ingest pipeline wired as its
-    /// handlers: `store` is the shared node store (whitelist,
+    /// handlers: `store` is the shared node store (trust,
     /// dedup, persistence, peer records), `config` the gossip
     /// validation config, and `decryptor` the optional payload
     /// decryption hook. This is the wiring `start_gossip_service`
@@ -806,7 +819,7 @@ impl PeerSink for GossipPeerSink {
         if let Some(store) = &self.store {
             let store = store.lock().unwrap();
             store
-                .gossip_peers_add_or_update(&peer.hostname, peer.port, 0, None, None)
+                .gossip_peers_add_or_update(&peer.hostname, peer.port, 0, None)
                 .map_err(|e| DiscoveryError::Sink(e.to_string()))?;
         }
         Ok(())
@@ -936,30 +949,54 @@ impl IngestPipeline {
         Arc::new(move |message, source| pipeline.ingest_message(message, Some(source)))
     }
 
-    /// Sender whitelist check shared by both C handlers:
-    /// the sender key must be 32 bytes and present in the
-    /// `gossip_peers` store (`gossip_peers_get_by_pubkey`).
+    /// Sender trust check shared by both C handlers: the
+    /// sender key must be 32 bytes and present in the
+    /// `node_trust` table. Trust is separate from the
+    /// `gossip_peers` address book (DESIGN.md §10), so
+    /// discovery/bootstrap writes can never grant or revoke it.
     fn check_whitelisted(&self, sender_pubkey: &[u8]) -> Result<()> {
         let Ok(key) = <[u8; 32]>::try_from(sender_pubkey) else {
             return Err(Error::Unauthorized);
         };
         let store = self.store.lock().unwrap();
-        match store.gossip_peers_get_by_pubkey(&key)? {
-            Some(_) => Ok(()),
-            None => Err(Error::Unauthorized),
+        match store.node_trust_is_trusted(&key)? {
+            true => Ok(()),
+            false => Err(Error::Unauthorized),
         }
     }
 
     /// C `gossip_receive_envelope_handler`, in its exact order:
-    /// validate, whitelist, dedup (seen digest of the serialized
+    /// validate, trust, dedup (seen digest of the serialized
     /// envelope), store envelope + recipients into
     /// `gossip_envelopes` (DESIGN.md 4.2: never
     /// `gossip_messages`), mark seen, discover peer from source,
     /// node-registration handling, content dispatch (failure is
     /// logged and ignored in C), rebroadcast excluding source.
     /// A duplicate returns `Ok` without re-storing or
-    /// re-forwarding, as in C.
+    /// re-forwarding, as in C. Every rejection — and every
+    /// duplicate drop — is logged with its reason
+    /// (DESIGN.md §10); nothing is dropped silently.
     pub fn ingest_envelope(
+        &self,
+        envelope: &Envelope,
+        source: Option<SocketAddr>,
+    ) -> Result<()> {
+        let result = self.ingest_envelope_inner(envelope, source);
+        if let Err(e) = &result {
+            let sender = envelope
+                .header
+                .as_ref()
+                .map(|h| hex(&h.sender_pubkey))
+                .unwrap_or_else(|| "none".to_string());
+            eprintln!(
+                "gossip ingest: rejected envelope from {} sender={sender}: {e}",
+                source_label(source)
+            );
+        }
+        result
+    }
+
+    fn ingest_envelope_inner(
         &self,
         envelope: &Envelope,
         source: Option<SocketAddr>,
@@ -967,7 +1004,7 @@ impl IngestPipeline {
         // 1. Validate envelope.
         validation::gossip_validate_envelope(envelope, &self.config, now_epoch())?;
 
-        // 2. Authorization: sender must be whitelisted.
+        // 2. Authorization: sender must be trusted.
         let header = envelope
             .header
             .as_ref()
@@ -980,6 +1017,11 @@ impl IngestPipeline {
         {
             let store = self.store.lock().unwrap();
             if store.gossip_store_has_seen(&digest)? {
+                eprintln!(
+                    "gossip ingest: dropped duplicate envelope from {} sender={} (already seen)",
+                    source_label(source),
+                    hex(&header.sender_pubkey)
+                );
                 return Ok(());
             }
             // 4. Store envelope + recipients, then mark seen.
@@ -1007,12 +1049,34 @@ impl IngestPipeline {
     }
 
     /// C `gossip_receive_message_handler`, in its exact order:
-    /// validate, whitelist, dedup, store, discover peer from
+    /// validate, trust, dedup, store, discover peer from
     /// source, rebroadcast. Storage goes through the store's
     /// message save (`user_messages`, as in C
     /// `message_store_save`); the retired `gossip_messages`
-    /// table is never written (DESIGN.md 4.2).
+    /// table is never written (DESIGN.md 4.2). Rejections and
+    /// duplicate drops are logged, as in
+    /// [`IngestPipeline::ingest_envelope`].
     pub fn ingest_message(
+        &self,
+        message: &Message,
+        source: Option<SocketAddr>,
+    ) -> Result<()> {
+        let result = self.ingest_message_inner(message, source);
+        if let Err(e) = &result {
+            let sender = message
+                .header
+                .as_ref()
+                .map(|h| hex(&h.sender_pubkey))
+                .unwrap_or_else(|| "none".to_string());
+            eprintln!(
+                "gossip ingest: rejected message from {} sender={sender}: {e}",
+                source_label(source)
+            );
+        }
+        result
+    }
+
+    fn ingest_message_inner(
         &self,
         message: &Message,
         source: Option<SocketAddr>,
@@ -1020,7 +1084,7 @@ impl IngestPipeline {
         // 1. Validate message (signature, timestamp, size).
         validation::message_validate(message)?;
 
-        // 2. Authorization (whitelist).
+        // 2. Authorization (trust).
         let header = message
             .header
             .as_ref()
@@ -1033,6 +1097,11 @@ impl IngestPipeline {
         {
             let mut store = self.store.lock().unwrap();
             if store.message_store_has_seen(&digest)? {
+                eprintln!(
+                    "gossip ingest: dropped duplicate message from {} sender={} (already seen)",
+                    source_label(source),
+                    hex(&header.sender_pubkey)
+                );
                 return Ok(());
             }
             // 4. Store, then mark seen.
@@ -1075,7 +1144,7 @@ impl IngestPipeline {
         let hostname = source.ip().to_string();
         if shared_add_peer(&self.shared, &hostname, GOSSIP_PORT).is_ok() {
             let store = self.store.lock().unwrap();
-            let _ = store.gossip_peers_add_or_update(&hostname, GOSSIP_PORT, 0, None, None);
+            let _ = store.gossip_peers_add_or_update(&hostname, GOSSIP_PORT, 0, None);
         }
     }
 
@@ -1106,7 +1175,7 @@ impl IngestPipeline {
         let hostname = node_reg.node_address.as_str();
         if shared_add_peer(&self.shared, hostname, GOSSIP_PORT).is_ok() {
             let store = self.store.lock().unwrap();
-            let _ = store.gossip_peers_add_or_update(hostname, GOSSIP_PORT, 0, None, None);
+            let _ = store.gossip_peers_add_or_update(hostname, GOSSIP_PORT, 0, None);
         }
     }
 }
@@ -1133,7 +1202,7 @@ mod tests {
     }
 
     /// A structurally valid, correctly signed envelope from the
-    /// key derived from `seed`, as a whitelisted C peer would send.
+    /// key derived from `seed`, as a trusted peer would send.
     fn signed_envelope(seed: u8, content_type: u32) -> (Envelope, [u8; 32]) {
         let signing = SigningKey::from_bytes(&[seed; 32]);
         let pubkey = signing.verifying_key().to_bytes();
@@ -1162,11 +1231,11 @@ mod tests {
         (envelope, pubkey)
     }
 
-    fn whitelist(store: &Arc<Mutex<Store>>, pubkey: &[u8; 32]) {
+    fn trust_sender(store: &Arc<Mutex<Store>>, pubkey: &[u8; 32]) {
         store
             .lock()
             .unwrap()
-            .gossip_peers_add_or_update("sender-node", 9000, 0, Some(pubkey), None)
+            .node_trust_add(pubkey, Some("sender-node"), "test")
             .unwrap();
     }
 
@@ -1268,7 +1337,7 @@ mod tests {
     fn second_ingest_does_not_restore_or_reforward() {
         let store = test_store();
         let (envelope, pubkey) = signed_envelope(9, 999);
-        whitelist(&store, &pubkey);
+        trust_sender(&store, &pubkey);
 
         // Capture socket standing in as the one known peer.
         let capture = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
@@ -1306,7 +1375,7 @@ mod tests {
     fn udp_loopback_broadcast_is_received_and_stored() {
         let receiver_store = test_store();
         let (envelope, pubkey) = signed_envelope(11, 999);
-        whitelist(&receiver_store, &pubkey);
+        trust_sender(&receiver_store, &pubkey);
 
         let mut receiver =
             GossipService::with_ingest(0, receiver_store.clone(), test_config(), None);
@@ -1318,7 +1387,7 @@ mod tests {
         sender.add_peer("127.0.0.1", receiver_port).unwrap();
         sender.broadcast_envelope(&envelope).unwrap();
 
-        // The receiver's ingest pipeline validates, whitelists,
+        // The receiver's ingest pipeline validates, trust-checks,
         // dedups and stores asynchronously on its receive thread.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut count = 0;
@@ -1333,5 +1402,73 @@ mod tests {
 
         sender.stop();
         receiver.stop();
+    }
+
+    /// DESIGN.md §10: an envelope whose sender is not trusted
+    /// is rejected with `Unauthorized` and nothing is stored.
+    /// (The rejection is also logged by `ingest_envelope`.)
+    #[test]
+    fn ingest_from_untrusted_sender_is_rejected() {
+        let store = test_store();
+        let (envelope, _pubkey) = signed_envelope(21, 999);
+        // No trust granted for the sender.
+        let mut service = GossipService::new(0, None, None);
+        let pipeline = service.attach_ingest(store.clone(), test_config(), None);
+        let source: SocketAddr = "127.0.0.1:59998".parse().unwrap();
+        let err = pipeline
+            .ingest_envelope(&envelope, Some(source))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unauthorized),
+            "expected Unauthorized, got {err}"
+        );
+        assert_eq!(stored_envelope_count(&store), 0);
+    }
+
+    /// A trusted sender whose envelope fails validation is
+    /// rejected with a `Validation` error — a reason distinct
+    /// from the trust rejection, so the log line can tell the
+    /// two apart.
+    #[test]
+    fn ingest_with_bad_signature_is_rejected_as_validation() {
+        let store = test_store();
+        let (mut envelope, pubkey) = signed_envelope(22, 999);
+        trust_sender(&store, &pubkey);
+        // Tamper with the ciphertext: the signing digest covers
+        // its hash, so the signature no longer verifies.
+        envelope.payload_ciphertext.push(0xFF);
+        let mut service = GossipService::new(0, None, None);
+        let pipeline = service.attach_ingest(store.clone(), test_config(), None);
+        let source: SocketAddr = "127.0.0.1:59997".parse().unwrap();
+        let err = pipeline
+            .ingest_envelope(&envelope, Some(source))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Validation(_)),
+            "expected Validation, got {err}"
+        );
+        assert_eq!(stored_envelope_count(&store), 0);
+    }
+
+    /// The pipeline-level form of the DESIGN.md §10 regression:
+    /// trust is granted, then discovery/bootstrap persists the
+    /// sender's address through the peer sink (the exact write
+    /// startup performs) — ingest from that sender must still
+    /// be accepted.
+    #[test]
+    fn trust_survives_discovery_sink_registration() {
+        let store = test_store();
+        let (envelope, pubkey) = signed_envelope(23, 999);
+        trust_sender(&store, &pubkey);
+
+        let mut service = GossipService::new(0, None, None);
+        let mut sink = service.peer_sink(Some(store.clone()));
+        sink.add_peer(&Peer::new("sender-node", 9000)).unwrap();
+        drop(sink);
+
+        let pipeline = service.attach_ingest(store.clone(), test_config(), None);
+        let source: SocketAddr = "127.0.0.1:59996".parse().unwrap();
+        pipeline.ingest_envelope(&envelope, Some(source)).unwrap();
+        assert_eq!(stored_envelope_count(&store), 1);
     }
 }

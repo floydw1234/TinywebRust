@@ -339,7 +339,10 @@ pub fn has_permission_in_scope(
     })
 }
 
-/// C `GossipPeerInfo` (`gossip_peers.h`).
+/// C `GossipPeerInfo` (`gossip_peers.h`). The address-book row;
+/// `node_pubkey` is display-only and is filled from the
+/// `node_trust` table (see [`NodeTrustEntry`]), never stored in
+/// `gossip_peers` anymore (DESIGN.md §10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GossipPeerInfo {
     pub hostname: String,
@@ -349,6 +352,25 @@ pub struct GossipPeerInfo {
     pub first_seen: u64,
     pub last_seen: u64,
     pub tags: String,
+}
+
+/// One row of the `node_trust` table: a node/member public key
+/// whose gossip this node accepts (the ingest whitelist).
+/// Trust lives apart from the `gossip_peers` address book
+/// (DESIGN.md §10): discovery/bootstrap write addresses only and
+/// can never modify trust; trust rows are written only by
+/// explicit trust operations (enrollment, seeding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeTrustEntry {
+    pub node_pubkey: [u8; PUBKEY_SIZE],
+    /// Address hint recorded when trust was granted (may be
+    /// empty when the grant was not tied to an address).
+    pub hostname: String,
+    /// Epoch seconds when trust was first granted.
+    pub trusted_at: u64,
+    /// How trust was granted (`enrollment`, `seed`, `migrated`,
+    /// ...), free-form.
+    pub source: String,
 }
 
 /// One row of the C `nodes` table (`nodes_get_by_id` out-params).
@@ -453,6 +475,7 @@ const CREATE_IDX_PEERS_LAST_SEEN: &str =
     "CREATE INDEX IF NOT EXISTS idx_gossip_peers_last_seen ON gossip_peers(last_seen);";
 const CREATE_IDX_PEERS_PUBKEY: &str =
     "CREATE INDEX IF NOT EXISTS idx_gossip_peers_node_pubkey ON gossip_peers(node_pubkey);";
+const CREATE_NODE_TRUST: &str = "CREATE TABLE IF NOT EXISTS node_trust ( node_pubkey BLOB PRIMARY KEY, hostname TEXT, trusted_at INTEGER NOT NULL, source TEXT NOT NULL DEFAULT '');";
 
 /// Statements of `gossip_store_init`, in C execution order.
 const GOSSIP_SCHEMA: &[&str] = &[
@@ -1577,18 +1600,39 @@ impl Store {
         }
         self.conn.execute_batch(CREATE_IDX_PEERS_LAST_SEEN)?;
         self.conn.execute_batch(CREATE_IDX_PEERS_PUBKEY)?;
+        self.node_trust_init()
+    }
+
+    /// Create the `node_trust` table and migrate any legacy
+    /// `gossip_peers.node_pubkey` values into it (DESIGN.md §10).
+    /// The migration is one-way and idempotent: rows already in
+    /// `node_trust` win, and the legacy column is left in place
+    /// (nothing reads or writes it from now on). Every trust
+    /// operation calls this first, like the C
+    /// `ensure_initialized`.
+    pub fn node_trust_init(&self) -> Result<()> {
+        // The migration reads gossip_peers, so make sure it
+        // exists even when a trust call comes first.
+        self.conn.execute_batch(CREATE_GOSSIP_PEERS)?;
+        self.conn.execute_batch(CREATE_NODE_TRUST)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO node_trust (node_pubkey, hostname, trusted_at, source) SELECT node_pubkey, hostname, first_seen, 'migrated' FROM gossip_peers WHERE node_pubkey IS NOT NULL AND length(node_pubkey) = ?",
+            params![PUBKEY_SIZE as i64],
+        )?;
         Ok(())
     }
 
-    /// `gossip_peers_add_or_update`. On hostname conflict the ports,
-    /// pubkey, `last_seen` and tags are replaced; `first_seen` is
-    /// preserved. Empty tags bind as NULL.
+    /// `gossip_peers_add_or_update`: address-book write ONLY.
+    /// On hostname conflict the ports, `last_seen` and tags are
+    /// replaced; `first_seen` is preserved. This never touches
+    /// trust (`node_trust`) or the legacy `node_pubkey` column,
+    /// so discovery/bootstrap persistence can never erase a
+    /// trusted key (DESIGN.md §10). Empty tags bind as NULL.
     pub fn gossip_peers_add_or_update(
         &self,
         hostname: &str,
         gossip_port: u16,
         api_port: u16,
-        node_pubkey: Option<&[u8; PUBKEY_SIZE]>,
         tags: Option<&str>,
     ) -> Result<()> {
         if hostname.is_empty() {
@@ -1596,15 +1640,13 @@ impl Store {
         }
         self.gossip_peers_init()?;
         let now = now_epoch() as i64;
-        let pubkey: Option<&[u8]> = node_pubkey.map(|k| &k[..]);
         let tags: Option<&str> = tags.filter(|t| !t.is_empty());
         self.conn.execute(
-            "INSERT INTO gossip_peers (hostname, gossip_port, api_port, node_pubkey, first_seen, last_seen, tags) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(hostname) DO UPDATE SET gossip_port=excluded.gossip_port, api_port=excluded.api_port, node_pubkey=excluded.node_pubkey, last_seen=excluded.last_seen, tags=excluded.tags",
+            "INSERT INTO gossip_peers (hostname, gossip_port, api_port, first_seen, last_seen, tags) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(hostname) DO UPDATE SET gossip_port=excluded.gossip_port, api_port=excluded.api_port, last_seen=excluded.last_seen, tags=excluded.tags",
             params![
                 hostname,
                 gossip_port as i64,
                 api_port as i64,
-                pubkey,
                 now,
                 now,
                 tags,
@@ -1625,16 +1667,21 @@ impl Store {
             params![now_epoch() as i64, hostname],
         )?;
         if changed == 0 {
-            self.gossip_peers_add_or_update(hostname, 0, 0, None, None)?;
+            self.gossip_peers_add_or_update(hostname, 0, 0, None)?;
         }
         Ok(())
     }
 
-    /// `gossip_peers_fetch_all`, ordered by hostname.
+    /// `gossip_peers_fetch_all`, ordered by hostname. The
+    /// `node_pubkey` of each row is display-only: it is the
+    /// trusted key recorded for that hostname in `node_trust`
+    /// (falling back to the legacy column for rows migrated
+    /// data has not covered), or all-zero when the peer is not
+    /// trusted.
     pub fn gossip_peers_fetch_all(&self) -> Result<Vec<GossipPeerInfo>> {
         self.gossip_peers_init()?;
         let mut stmt = self.conn.prepare(
-            "SELECT hostname, gossip_port, api_port, node_pubkey, first_seen, last_seen, COALESCE(tags, '') FROM gossip_peers ORDER BY hostname",
+            "SELECT hostname, gossip_port, api_port, COALESCE((SELECT node_pubkey FROM node_trust WHERE node_trust.hostname = gossip_peers.hostname ORDER BY trusted_at ASC LIMIT 1), node_pubkey), first_seen, last_seen, COALESCE(tags, '') FROM gossip_peers ORDER BY hostname",
         )?;
         let rows = stmt.query_map(params![], peer_from_row)?;
         let mut out = Vec::new();
@@ -1644,21 +1691,78 @@ impl Store {
         Ok(out)
     }
 
-    /// `gossip_peers_get_by_pubkey`: `Ok(None)` when not found
-    /// (C returns -1 there).
-    pub fn gossip_peers_get_by_pubkey(
+    /// Grant trust to a node/member public key (the ingest
+    /// whitelist). This is the ONLY write path for trust:
+    /// enrollment and explicit seeding call it; discovery and
+    /// other address-book writes never do (DESIGN.md §10).
+    /// Re-granting an already-trusted key refreshes its
+    /// hostname hint and source but keeps the original
+    /// `trusted_at`.
+    pub fn node_trust_add(
         &self,
         node_pubkey: &[u8; PUBKEY_SIZE],
-    ) -> Result<Option<GossipPeerInfo>> {
-        self.gossip_peers_init()?;
+        hostname: Option<&str>,
+        source: &str,
+    ) -> Result<()> {
+        self.node_trust_init()?;
+        let hostname: Option<&str> = hostname.filter(|h| !h.is_empty());
+        self.conn.execute(
+            "INSERT INTO node_trust (node_pubkey, hostname, trusted_at, source) VALUES (?, ?, ?, ?) ON CONFLICT(node_pubkey) DO UPDATE SET hostname=COALESCE(excluded.hostname, node_trust.hostname), source=excluded.source",
+            params![&node_pubkey[..], hostname, now_epoch() as i64, source],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `node_pubkey` is currently trusted.
+    pub fn node_trust_is_trusted(&self, node_pubkey: &[u8; PUBKEY_SIZE]) -> Result<bool> {
+        self.node_trust_init()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM node_trust WHERE node_pubkey = ?")?;
+        let mut rows = stmt.query(params![&node_pubkey[..]])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// The trust entry for `node_pubkey`, `Ok(None)` when the
+    /// key is not trusted.
+    pub fn node_trust_get(
+        &self,
+        node_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<Option<NodeTrustEntry>> {
+        self.node_trust_init()?;
         let mut stmt = self.conn.prepare(
-            "SELECT hostname, gossip_port, api_port, node_pubkey, first_seen, last_seen, COALESCE(tags, '') FROM gossip_peers WHERE node_pubkey = ? LIMIT 1",
+            "SELECT node_pubkey, COALESCE(hostname, ''), trusted_at, source FROM node_trust WHERE node_pubkey = ?",
         )?;
         let mut rows = stmt.query(params![&node_pubkey[..]])?;
         match rows.next()? {
-            Some(row) => Ok(Some(peer_from_row(row)?)),
+            Some(row) => Ok(Some(trust_from_row(row)?)),
             None => Ok(None),
         }
+    }
+
+    /// Revoke trust for `node_pubkey`; returns whether an entry
+    /// was removed.
+    pub fn node_trust_remove(&self, node_pubkey: &[u8; PUBKEY_SIZE]) -> Result<bool> {
+        self.node_trust_init()?;
+        let changed = self.conn.execute(
+            "DELETE FROM node_trust WHERE node_pubkey = ?",
+            params![&node_pubkey[..]],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// All trust entries, oldest grant first.
+    pub fn node_trust_list(&self) -> Result<Vec<NodeTrustEntry>> {
+        self.node_trust_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT node_pubkey, COALESCE(hostname, ''), trusted_at, source FROM node_trust ORDER BY trusted_at ASC, node_pubkey ASC",
+        )?;
+        let rows = stmt.query_map(params![], trust_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Delete a peer by hostname; returns whether a row was removed.
@@ -1804,6 +1908,20 @@ impl Store {
             .iter()
             .any(|r| has_permission_in_scope(&r.permission_sets, permission, scope, now))
     }
+}
+
+fn trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeTrustEntry> {
+    let pubkey_blob: Vec<u8> = row.get(0)?;
+    let mut node_pubkey = [0u8; PUBKEY_SIZE];
+    if pubkey_blob.len() == PUBKEY_SIZE {
+        node_pubkey.copy_from_slice(&pubkey_blob);
+    }
+    Ok(NodeTrustEntry {
+        node_pubkey,
+        hostname: row.get(1)?,
+        trusted_at: row.get::<_, i64>(2)? as u64,
+        source: row.get(3)?,
+    })
 }
 
 fn peer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GossipPeerInfo> {
@@ -1974,6 +2092,7 @@ mod tests {
             "location_updates",
             "location_keywraps",
             "gossip_peers",
+            "node_trust",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -2237,21 +2356,21 @@ mod tests {
     #[test]
     fn gossip_peer_add_list_remove() {
         let store = test_store();
-        let key1 = [0x01u8; 32];
-        let key2 = [0x02u8; 32];
         store
-            .gossip_peers_add_or_update("host-b", 9000, 8000, Some(&key2), Some("beta"))
+            .gossip_peers_add_or_update("host-b", 9000, 8000, Some("beta"))
             .unwrap();
         store
-            .gossip_peers_add_or_update("host-a", 9001, 8001, Some(&key1), None)
+            .gossip_peers_add_or_update("host-a", 9001, 8001, None)
             .unwrap();
 
-        // Ordered by hostname.
+        // Ordered by hostname. Address rows carry no key on
+        // their own: node_pubkey is zero until trust is granted
+        // for that hostname.
         let peers = store.gossip_peers_fetch_all().unwrap();
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].hostname, "host-a");
         assert_eq!(peers[0].gossip_port, 9001);
-        assert_eq!(peers[0].node_pubkey, key1);
+        assert_eq!(peers[0].node_pubkey, [0u8; 32]);
         assert_eq!(peers[0].tags, "");
         assert_eq!(peers[1].tags, "beta");
         assert!(peers[0].first_seen > 0);
@@ -2259,13 +2378,12 @@ mod tests {
         // Update keeps first_seen, replaces ports/tags.
         let first_seen = peers[0].first_seen;
         store
-            .gossip_peers_add_or_update("host-a", 9100, 8100, Some(&key1), Some("alpha"))
+            .gossip_peers_add_or_update("host-a", 9100, 8100, Some("alpha"))
             .unwrap();
-        let by_key = store.gossip_peers_get_by_pubkey(&key1).unwrap().unwrap();
-        assert_eq!(by_key.gossip_port, 9100);
-        assert_eq!(by_key.tags, "alpha");
-        assert_eq!(by_key.first_seen, first_seen);
-        assert!(store.gossip_peers_get_by_pubkey(&[0x77u8; 32]).unwrap().is_none());
+        let peers = store.gossip_peers_fetch_all().unwrap();
+        assert_eq!(peers[0].gossip_port, 9100);
+        assert_eq!(peers[0].tags, "alpha");
+        assert_eq!(peers[0].first_seen, first_seen);
 
         // Touch on an unknown host inserts a zero-port placeholder.
         store.gossip_peers_touch("host-c").unwrap();
@@ -2280,9 +2398,140 @@ mod tests {
         assert_eq!(store.gossip_peers_fetch_all().unwrap().len(), 2);
 
         // Empty hostname is rejected, as in C.
-        assert!(store
-            .gossip_peers_add_or_update("", 1, 1, None, None)
-            .is_err());
+        assert!(store.gossip_peers_add_or_update("", 1, 1, None).is_err());
+    }
+
+    #[test]
+    fn node_trust_add_get_list_remove() {
+        let store = test_store();
+        let key1 = [0x01u8; 32];
+        let key2 = [0x02u8; 32];
+        assert!(!store.node_trust_is_trusted(&key1).unwrap());
+        assert!(store.node_trust_get(&key1).unwrap().is_none());
+
+        store
+            .node_trust_add(&key1, Some("host-a"), "seed")
+            .unwrap();
+        store.node_trust_add(&key2, None, "enrollment").unwrap();
+        assert!(store.node_trust_is_trusted(&key1).unwrap());
+        assert!(store.node_trust_is_trusted(&key2).unwrap());
+
+        let entry = store.node_trust_get(&key1).unwrap().unwrap();
+        assert_eq!(entry.hostname, "host-a");
+        assert_eq!(entry.source, "seed");
+        assert!(entry.trusted_at > 0);
+        // A grant without an address records an empty hint.
+        assert_eq!(store.node_trust_get(&key2).unwrap().unwrap().hostname, "");
+
+        // The peer list surfaces the trusted key for its hostname.
+        store
+            .gossip_peers_add_or_update("host-a", 9000, 8000, None)
+            .unwrap();
+        let peers = store.gossip_peers_fetch_all().unwrap();
+        assert_eq!(peers[0].node_pubkey, key1);
+
+        let list = store.node_trust_list().unwrap();
+        assert_eq!(list.len(), 2);
+
+        // Re-grant refreshes the source but keeps trusted_at.
+        let before = store.node_trust_get(&key1).unwrap().unwrap();
+        store
+            .node_trust_add(&key1, Some("host-a2"), "enrollment")
+            .unwrap();
+        let after = store.node_trust_get(&key1).unwrap().unwrap();
+        assert_eq!(after.trusted_at, before.trusted_at);
+        assert_eq!(after.hostname, "host-a2");
+        assert_eq!(after.source, "enrollment");
+
+        // Revocation: first remove reports true, second false.
+        assert!(store.node_trust_remove(&key1).unwrap());
+        assert!(!store.node_trust_is_trusted(&key1).unwrap());
+        assert!(!store.node_trust_remove(&key1).unwrap());
+    }
+
+    /// Regression test for DESIGN.md §10: discovery/bootstrap
+    /// persistence (the exact `gossip_peers_add_or_update` call
+    /// the peer sink performs, plus touch) must never erase a
+    /// trusted key.
+    #[test]
+    fn node_trust_survives_discovery_upserts() {
+        let store = test_store();
+        let key = [0x42u8; 32];
+        store.node_trust_add(&key, Some("host-a"), "seed").unwrap();
+
+        // Address-book writes of every flavour discovery makes.
+        store
+            .gossip_peers_add_or_update("host-a", 9000, 8000, None)
+            .unwrap();
+        store
+            .gossip_peers_add_or_update("host-a", 9000, 0, None)
+            .unwrap();
+        store.gossip_peers_touch("host-a").unwrap();
+
+        assert!(store.node_trust_is_trusted(&key).unwrap());
+        let entry = store.node_trust_get(&key).unwrap().unwrap();
+        assert_eq!(entry.hostname, "host-a");
+        // ... and the address row still displays the trusted key.
+        let peers = store.gossip_peers_fetch_all().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_pubkey, key);
+    }
+
+    /// A database written by the pre-fix code (pubkey in the
+    /// peers table) keeps its trust after the split: the first
+    /// trust/peer operation migrates the legacy values.
+    #[test]
+    fn node_trust_migrates_legacy_peer_pubkeys() {
+        let store = test_store();
+        let key = [0x24u8; 32];
+        store
+            .connection()
+            .execute(
+                "INSERT INTO gossip_peers (hostname, gossip_port, api_port, node_pubkey, first_seen, last_seen, tags) VALUES ('legacy', 9000, 8000, ?1, 100, 100, NULL)",
+                params![&key[..]],
+            )
+            .unwrap();
+        assert!(store.node_trust_is_trusted(&key).unwrap());
+        let entry = store.node_trust_get(&key).unwrap().unwrap();
+        assert_eq!(entry.source, "migrated");
+        assert_eq!(entry.hostname, "legacy");
+        assert_eq!(entry.trusted_at, 100);
+    }
+
+    /// The Wave 2 smoke scenario at store level (DESIGN.md
+    /// §10): trust is applied, the store is reopened (node
+    /// restart), startup bootstrap persists the peer's address
+    /// again — and the key must still be trusted.
+    #[test]
+    fn node_trust_survives_reopen_and_bootstrap() {
+        let path = std::env::temp_dir().join(format!(
+            "tinyweb_store_trust_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let key = [0x33u8; 32];
+        {
+            let store = Store::open(&path).unwrap();
+            store.init_schema().unwrap();
+            store
+                .node_trust_add(&key, Some("peer-node"), "seed")
+                .unwrap();
+            store
+                .gossip_peers_add_or_update("peer-node", 9000, 8000, None)
+                .unwrap();
+        }
+        // "Restart": reopen, re-init, re-run bootstrap's
+        // address persistence for the already-known peer.
+        let store = Store::open(&path).unwrap();
+        store.init_schema().unwrap();
+        store
+            .gossip_peers_add_or_update("peer-node", 9000, 0, None)
+            .unwrap();
+        assert!(store.node_trust_is_trusted(&key).unwrap());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

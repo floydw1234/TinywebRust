@@ -279,9 +279,11 @@ impl DiscoveryConfig {
 
 /// Destination for discovered peers: models C's pair of
 /// `gossip_service_add_peer` (gossip service) and
-/// `gossip_peers_add_or_update(hostname, port, 0, NULL, NULL)`
-/// (peer store) calls. Returning `Err` means the peer was not
-/// registered; backends then skip it without failing, as C does.
+/// `gossip_peers_add_or_update(hostname, port, 0, NULL)`
+/// (peer store) calls. The store write is address-only:
+/// discovery never grants trust (DESIGN.md §10). Returning
+/// `Err` means the peer was not registered; backends then
+/// skip it without failing, as C does.
 pub trait PeerSink {
     /// Register one peer with the gossip service and peer store.
     fn add_peer(&mut self, peer: &Peer) -> Result<(), DiscoveryError>;
