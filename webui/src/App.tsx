@@ -5,8 +5,9 @@ import { shortHex } from './utils/hex'
 import Dashboard from './pages/Dashboard'
 import Messages from './pages/Messages'
 import Location from './pages/Location'
+import Enroll from './pages/Enroll'
 
-type Tab = 'dashboard' | 'messages' | 'location'
+type Tab = 'dashboard' | 'messages' | 'location' | 'enroll'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('dashboard')
@@ -48,6 +49,9 @@ export default function App() {
           <button className={tab === 'location' ? 'active' : ''} onClick={() => setTab('location')}>
             Location
           </button>
+          <button className={tab === 'enroll' ? 'active' : ''} onClick={() => setTab('enroll')}>
+            Enroll
+          </button>
         </nav>
         <span className="identity-chip">
           {identity ? `identity: ${shortHex(identity)}` : 'no identity'}
@@ -60,6 +64,7 @@ export default function App() {
         )}
         {tab === 'messages' && <Messages identity={identity} />}
         {tab === 'location' && <Location identity={identity} />}
+        {tab === 'enroll' && <Enroll onIdentityChanged={refreshIdentity} />}
       </main>
 
       <footer className="last-call">

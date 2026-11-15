@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import keyStore from '../utils/keystore'
 import { getBaseUrl, setBaseUrl, getHealth, getPeers, getUsers, login, type NodeUser, type RawCall } from '../api'
 import { shortHex } from '../utils/hex'
+import { getEnrollmentMeta, type EnrollmentMeta } from '../utils/enrollment'
 
 interface Props {
   identity: string | null
@@ -22,6 +23,7 @@ export default function Dashboard({ identity, onIdentityChanged, rawCalls }: Pro
   const [users, setUsers] = useState<NodeUser[] | null>(null)
   const [usersErr, setUsersErr] = useState('')
   const [selectedCall, setSelectedCall] = useState<number | null>(null)
+  const [enrollMeta, setEnrollMeta] = useState<EnrollmentMeta | null>(null)
 
   const refreshHealth = async () => {
     setHealthErr('')
@@ -42,6 +44,10 @@ export default function Dashboard({ identity, onIdentityChanged, rawCalls }: Pro
       setPeersErr(e instanceof Error ? e.message : String(e))
     }
   }
+
+  useEffect(() => {
+    setEnrollMeta(getEnrollmentMeta())
+  }, [identity])
 
   useEffect(() => {
     void refreshHealth()
@@ -130,21 +136,16 @@ export default function Dashboard({ identity, onIdentityChanged, rawCalls }: Pro
       ? String((health as Record<string, unknown>).status)
       : null
 
+  const enrollmentText = !enrollMeta
+    ? 'not enrolled'
+    : enrollMeta.phase === 'enrolled'
+      ? `enrolled as ${enrollMeta.displayName} (device ${shortHex(enrollMeta.devicePubkey)})`
+      : enrollMeta.phase === 'pending'
+        ? 'pairing code issued, waiting for approval'
+        : 'identity created, not yet enrolled' 
+
   return (
     <div>
-      <div className="banner">
-        <strong>Registration seam:</strong> signed API calls only work once this browser identity's
-        public key exists in the node's <span className="mono">users</span> table — the node has no
-        self-registration endpoint. Until then, calls fail with{' '}
-        <span className="mono">401 "User not registered"</span> (that response still proves the
-        signing is correct). The node's own tests register users with a direct insert, e.g.:
-        <pre className="raw" style={{ marginTop: 8 }}>
-          {`INSERT INTO users (pubkey, username, age) VALUES ('${identity || '<your pubkey hex>'}', 'webui', NULL);`}
-        </pre>
-        The permanent registration/enrollment flow is being settled by the Wave 2 work; this panel
-        marks the seam rather than bypassing it.
-      </div>
-
       <div className="card">
         <h2>Connection</h2>
         <label className="field">Node base URL (default /api → Vite proxy → http://localhost:8000)</label>
@@ -174,6 +175,9 @@ export default function Dashboard({ identity, onIdentityChanged, rawCalls }: Pro
         ) : (
           <p className="status-line status-bad">No identity loaded. Generate or import one to sign requests.</p>
         )}
+        <p className="status-line">
+          Enrollment: <strong>{enrollmentText}</strong> — join this household from the Enroll tab.
+        </p>
         <div className="row">
           <button onClick={doGenerate}>{identity ? 'Regenerate identity' : 'Generate identity'}</button>
           <button className="secondary" onClick={doLogin} disabled={!identity}>

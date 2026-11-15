@@ -24,11 +24,23 @@ const STORAGE_KEY = 'tinyweb_keypair'
 // identity generation. The stored format is unchanged.
 const SALT_BYTES = 16
 
-class KeyStore {
+export class KeyStore {
+  private storageKey: string
   private initialized = false
   private loadError: string | null = null
   private signPublicKey: Uint8Array | null = null
   private signSecretKey: Uint8Array | null = null
+
+  /**
+   * Each instance seals its keypair under its own localStorage key.
+   * The default singleton uses the legacy `tinyweb_keypair` key;
+   * enrollment keeps its member/device keys under their own keys
+   * (see utils/enrollment.ts) so joining never disturbs the active
+   * identity until the member is actually enrolled.
+   */
+  constructor(storageKey: string = STORAGE_KEY) {
+    this.storageKey = storageKey
+  }
 
   async init(): Promise<boolean> {
     if (this.initialized) {
@@ -43,7 +55,7 @@ class KeyStore {
 
   private async tryAutoLoad(): Promise<void> {
     try {
-      if (localStorage.getItem(STORAGE_KEY) && !this.isKeypairLoaded()) {
+      if (localStorage.getItem(this.storageKey) && !this.isKeypairLoaded()) {
         await this.loadKeypair('')
       }
     } catch (e) {
@@ -86,11 +98,11 @@ class KeyStore {
       ciphertext: sodium.to_hex(ciphertext),
       publicKey: sodium.to_hex(this.signPublicKey),
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(keyData))
+    localStorage.setItem(this.storageKey, JSON.stringify(keyData))
   }
 
   async loadKeypair(passphrase: string): Promise<void> {
-    const stored = localStorage.getItem(STORAGE_KEY)
+    const stored = localStorage.getItem(this.storageKey)
     if (!stored) throw new Error('No keypair found in storage')
     const keyData = JSON.parse(stored)
 
@@ -166,11 +178,11 @@ class KeyStore {
   }
 
   hasStoredKeypair(): boolean {
-    return localStorage.getItem(STORAGE_KEY) !== null
+    return localStorage.getItem(this.storageKey) !== null
   }
 
   deleteStoredKeypair(): void {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(this.storageKey)
     this.loadError = null
   }
 

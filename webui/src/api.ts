@@ -299,6 +299,52 @@ export async function getLocationHistory(
   return { updates, failed }
 }
 
+// ---- Enrollment (Phase B3/B5) ----
+
+export interface EnrollBeginRequest {
+  member_pubkey: string
+  device_pubkey: string
+  display_name: string
+  device_cert: string // hex of the serialized DeviceCertificate protobuf
+}
+
+export interface EnrollBeginResult {
+  status: string
+  code: string
+  expires_at: number
+  member_pubkey: string
+  device_pubkey: string
+}
+
+/**
+ * POST /enroll/begin — open a pairing for a joining member/device.
+ * Unauthenticated by design: the device has no credentials yet; the
+ * returned single-use code is the capability, and nothing is
+ * enrolled until an approver signs.
+ */
+export async function enrollBegin(body: EnrollBeginRequest): Promise<EnrollBeginResult> {
+  const r = await rawFetch('POST', '/enroll/begin', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  throwIfError(r, 'Enrollment begin failed')
+  return r.json as EnrollBeginResult
+}
+
+export interface EnrollStatusResult {
+  status: string // pending | approved | expired | unknown
+  member_pubkey?: string
+  device_pubkey?: string
+  expires_at?: number
+}
+
+/** GET /enroll/status?code=... — poll a pairing (the code is the capability). */
+export async function enrollStatus(code: string): Promise<EnrollStatusResult> {
+  const r = await rawFetch('GET', `/enroll/status?code=${encodeURIComponent(code)}`)
+  throwIfError(r, 'Enrollment status failed')
+  return r.json as EnrollStatusResult
+}
+
 // ---- Message decryption helper ----
 
 /** Decrypt a message's text with the loaded identity; null if not decryptable. */

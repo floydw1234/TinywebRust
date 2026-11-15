@@ -158,6 +158,15 @@ const PROTO_DEFINITION = `
     uint64 timestamp = 4;
     string location_name = 5;
   }
+
+  message DeviceCertificate {
+    bytes member_pubkey = 1;
+    bytes device_pubkey = 2;
+    string label = 3;
+    uint64 issued_at = 4;
+    uint64 expires_at = 5;
+    bytes signature = 6;
+  }
 `
 
 interface Types {
@@ -167,6 +176,7 @@ interface Types {
   ClientRequest: protobuf.Type
   Envelope: protobuf.Type
   LocationUpdate: protobuf.Type
+  DeviceCertificate: protobuf.Type
 }
 
 let cached: Types | null = null
@@ -181,6 +191,7 @@ function types(): Types {
     ClientRequest: root.lookupType('tinyweb.ClientRequest'),
     Envelope: root.lookupType('tinyweb.Envelope'),
     LocationUpdate: root.lookupType('tinyweb.LocationUpdate'),
+    DeviceCertificate: root.lookupType('tinyweb.DeviceCertificate'),
   }
   return cached
 }
@@ -426,5 +437,50 @@ export function decodeLocationUpdate(bytes: Uint8Array): LocationUpdateData {
     accuracy_m: loc.accuracy_m || 0,
     timestamp: Number(loc.timestamp || 0),
     location_name: loc.location_name || '',
+  }
+}
+
+// ---- DeviceCertificate (content.proto; enrollment, Phase B3) ----
+
+/**
+ * A member key's signed vouch for a device key. Field numbers and
+ * semantics match content.proto exactly; the signature inside is
+ * over the TWDEVCERT digest (see utils/deviceCert.ts).
+ */
+export interface DeviceCertificateData {
+  memberPubkey: Uint8Array
+  devicePubkey: Uint8Array
+  label: string
+  issuedAt: number // unix seconds
+  expiresAt: number // unix seconds; 0 = never expires
+  signature: Uint8Array
+}
+
+export function serializeDeviceCertificate(cert: DeviceCertificateData): Uint8Array {
+  const t = types()
+  const proto = {
+    member_pubkey: cert.memberPubkey,
+    device_pubkey: cert.devicePubkey,
+    label: cert.label,
+    issued_at: cert.issuedAt,
+    expires_at: cert.expiresAt,
+    signature: cert.signature,
+  }
+  const err = t.DeviceCertificate.verify(proto)
+  if (err) throw new Error(`Invalid DeviceCertificate: ${err}`)
+  return new Uint8Array(t.DeviceCertificate.encode(t.DeviceCertificate.create(proto)).finish())
+}
+
+export function deserializeDeviceCertificate(bytes: Uint8Array): DeviceCertificateData {
+  const t = types()
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = t.DeviceCertificate.decode(bytes) as any
+  return {
+    memberPubkey: asBytes(c.member_pubkey),
+    devicePubkey: asBytes(c.device_pubkey),
+    label: c.label || '',
+    issuedAt: Number(c.issued_at || 0),
+    expiresAt: Number(c.expires_at || 0),
+    signature: asBytes(c.signature),
   }
 }
