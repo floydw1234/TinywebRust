@@ -305,6 +305,70 @@ fn verify_device_revocation_inner(rev: &DeviceRevocation) -> Result<()> {
     verify_signature(member_pubkey, &digest, &rev.signature)
 }
 
+// ---------------------------------------------------------------------------
+// Enrollment approvals (Phase B3)
+// ---------------------------------------------------------------------------
+
+/// Domain separator for the enrollment-approval signing digest.
+pub const ENROLL_APPROVAL_DOMAIN: &[u8] = b"TWENROLLAPPROVE\0";
+
+/// Signing digest for an enrollment approval:
+/// `SHA256("TWENROLLAPPROVE\0" || member_pubkey || device_pubkey ||
+/// cert_hash || timestamp (LE u64))`.
+///
+/// This is the signature that turns a pending pairing into an
+/// enrollment (DESIGN.md §3.2). The signer is the approver's
+/// *device key* (a parent approving from their phone) or the
+/// household *recovery key* (the printed backup card) — never the
+/// joining member's own key: for a brand-new member that key is
+/// self-asserted, so the trust anchor is the approver's signature
+/// binding exactly the member key, the device key, and the hash
+/// of the member-signed device certificate being enrolled, at a
+/// stated time. `cert_hash` is the store's hash of the serialized
+/// certificate (`SHA256` of its protobuf encoding, as recorded by
+/// the `devices` / `pairing_codes` tables).
+pub fn enrollment_approval_digest(
+    member_pubkey: &[u8; SIGN_PUBKEY_SIZE],
+    device_pubkey: &[u8; SIGN_PUBKEY_SIZE],
+    cert_hash: &[u8; 32],
+    timestamp: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ENROLL_APPROVAL_DOMAIN);
+    hasher.update(member_pubkey);
+    hasher.update(device_pubkey);
+    hasher.update(cert_hash);
+    hasher.update(timestamp.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Verify an enrollment approval signed by `signer_pubkey` (an
+/// approving parent's device key, or the household recovery key)
+/// over [`enrollment_approval_digest`]. Every rejection is logged
+/// with its reason before the error is returned.
+pub fn verify_enrollment_approval(
+    signer_pubkey: &[u8; SIGN_PUBKEY_SIZE],
+    member_pubkey: &[u8; SIGN_PUBKEY_SIZE],
+    device_pubkey: &[u8; SIGN_PUBKEY_SIZE],
+    cert_hash: &[u8; 32],
+    timestamp: u64,
+    signature: &[u8],
+) -> Result<()> {
+    let digest = enrollment_approval_digest(member_pubkey, device_pubkey, cert_hash, timestamp);
+    match verify_signature(signer_pubkey, &digest, signature) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!(
+                "identity: rejected enrollment approval signer={} member={} device={}: {e}",
+                hex(signer_pubkey),
+                hex(member_pubkey),
+                hex(device_pubkey)
+            );
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +523,85 @@ mod tests {
             issue_device_certificate(&member, "no-such-device", NOW, 0),
             Err(Error::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn enrollment_approval_round_trip_and_tamper() {
+        use ed25519_dalek::Signer;
+        use prost::Message as _;
+        let (member, device_pubkey) = member_with_device();
+        let member_pubkey = member.member_public_key().expect("member pk");
+        let cert = issue_device_certificate(&member, "phone", NOW, 0).expect("issue");
+        let cert_hash: [u8; 32] = Sha256::digest(cert.encode_to_vec()).into();
+        // The approver signs with their *device* key.
+        let device_secret = member
+            .device_keystore("phone")
+            .expect("device keystore")
+            .get_private_key()
+            .expect("device secret");
+        let device_signing = SigningKey::from_keypair_bytes(&device_secret).expect("device key");
+        let digest = enrollment_approval_digest(&member_pubkey, &device_pubkey, &cert_hash, NOW);
+        let signature = device_signing.sign(&digest).to_bytes();
+
+        verify_enrollment_approval(
+            &device_pubkey,
+            &member_pubkey,
+            &device_pubkey,
+            &cert_hash,
+            NOW,
+            &signature,
+        )
+        .expect("approval verifies");
+
+        // A different certificate hash (a different enrollment)
+        // breaks the approval.
+        let other_hash: [u8; 32] = Sha256::digest(b"other cert").into();
+        assert!(matches!(
+            verify_enrollment_approval(
+                &device_pubkey,
+                &member_pubkey,
+                &device_pubkey,
+                &other_hash,
+                NOW,
+                &signature
+            ),
+            Err(Error::BadSignature)
+        ));
+        // A later timestamp is a different approval.
+        assert!(matches!(
+            verify_enrollment_approval(
+                &device_pubkey,
+                &member_pubkey,
+                &device_pubkey,
+                &cert_hash,
+                NOW + 1,
+                &signature
+            ),
+            Err(Error::BadSignature)
+        ));
+        // The member key is not the approver: its signature over
+        // the same digest does not verify as the device key.
+        let member_secret = member
+            .member_keystore()
+            .get_private_key()
+            .expect("member secret");
+        let member_signing = SigningKey::from_keypair_bytes(&member_secret).expect("member key");
+        let member_sig = member_signing.sign(&digest).to_bytes();
+        assert!(matches!(
+            verify_enrollment_approval(
+                &device_pubkey,
+                &member_pubkey,
+                &device_pubkey,
+                &cert_hash,
+                NOW,
+                &member_sig
+            ),
+            Err(Error::BadSignature)
+        ));
+        // The digest is domain-separated from the certificate digest.
+        assert_ne!(
+            digest,
+            device_certificate_digest(&member_pubkey, &device_pubkey, "phone", NOW, 0)
+        );
     }
 }

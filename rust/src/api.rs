@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 
 use crate::gossip::GossipService;
 use crate::proto::{
-    ClientRequest, ConversationList, Envelope, Message, MessageList,
+    ClientRequest, ConversationList, DeviceCertificate, Envelope, Message, MessageList,
 };
 use crate::store::{
     PermissionScope, Store, PERMISSION_VIEW_LOCATION, PUBKEY_SIZE,
@@ -477,6 +477,12 @@ pub enum Route {
     LocationHistory { user_id: String },
     /// `POST /auth/login` (authApi.c)
     Login,
+    /// `POST /enroll/begin` (Phase B3, DESIGN.md §5)
+    EnrollBegin,
+    /// `POST /enroll/approve` (Phase B3, DESIGN.md §5)
+    EnrollApprove,
+    /// `GET /enroll/status` (Phase B3, DESIGN.md §5)
+    EnrollStatus,
     /// No route matched: C replies 404.
     NotFound,
 }
@@ -496,6 +502,9 @@ pub fn route(path: &str) -> Route {
         "/users" => Route::Users,
         "/location/update" => Route::LocationUpdate,
         "/auth/login" => Route::Login,
+        "/enroll/begin" => Route::EnrollBegin,
+        "/enroll/approve" => Route::EnrollApprove,
+        "/enroll/status" => Route::EnrollStatus,
         _ => {
             if let Some(rest) = path.strip_prefix("/location/history/") {
                 if !rest.is_empty() && !rest.contains('/') {
@@ -520,13 +529,15 @@ pub fn route(path: &str) -> Route {
 /// in gossipApi.c.
 fn allowed_methods_for(path: &str) -> &'static str {
     match path {
-        "/messages/submit" | "/gossip/message" | "/location/update" => "POST, OPTIONS",
+        "/messages/submit" | "/gossip/message" | "/location/update" | "/enroll/begin"
+        | "/enroll/approve" => "POST, OPTIONS",
         "/gossip/peers"
         | "/health"
         | "/messages/recent"
         | "/messages/conversation"
         | "/messages/conversations"
-        | "/users" => "GET, OPTIONS",
+        | "/users"
+        | "/enroll/status" => "GET, OPTIONS",
         _ if path.starts_with("/location/") => "GET, OPTIONS",
         _ => "GET, POST, OPTIONS",
     }
@@ -866,6 +877,18 @@ pub fn handle_request(state: &ApiState, request: &Request) -> Response {
         },
         Route::Login => match request.method.as_str() {
             "POST" => handle_login(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::EnrollBegin => match request.method.as_str() {
+            "POST" => handle_enroll_begin(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::EnrollApprove => match request.method.as_str() {
+            "POST" => handle_enroll_approve(state, request),
+            _ => Response::json_error(405, "Method Not Allowed"),
+        },
+        Route::EnrollStatus => match request.method.as_str() {
+            "GET" => handle_enroll_status(state, request),
             _ => Response::json_error(405, "Method Not Allowed"),
         },
         Route::NotFound => Response::json_error(404, "Not Found"),
@@ -1400,6 +1423,424 @@ fn handle_login(state: &ApiState, request: &Request) -> Response {
     )
 }
 
+// -- enrollment (Phase B3, DESIGN.md §3.2/§5) -------------------------------
+
+/// Pairing code lifetime: single-use, ~10 minutes (DESIGN.md
+/// §3.2, the same TTL tinywebStack chose for its app codes).
+pub const PAIRING_CODE_TTL_SECONDS: u64 = 600;
+/// Pairing code entropy: 128 random bits, hex-encoded for the
+/// link/QR the joining device shows the parent.
+pub const PAIRING_CODE_BYTES: usize = 16;
+
+/// A fresh pairing code and the hash the store keys it by. The
+/// code itself is returned to the joining device exactly once
+/// (in the begin response) and never stored or logged.
+fn generate_pairing_code() -> Option<(String, [u8; PUBKEY_SIZE])> {
+    let mut raw = [0u8; PAIRING_CODE_BYTES];
+    getrandom::getrandom(&mut raw).ok()?;
+    let code = hex_encode(&raw);
+    let hash: [u8; PUBKEY_SIZE] = Sha256::digest(code.as_bytes()).into();
+    Some((code, hash))
+}
+
+/// The store lookup hash for a presented code. Codes are
+/// case-insensitive hex; surrounding whitespace is ignored.
+fn pairing_code_hash(code: &str) -> [u8; PUBKEY_SIZE] {
+    let normalized = code.trim().to_ascii_lowercase();
+    Sha256::digest(normalized.as_bytes()).into()
+}
+
+fn json_body(request: &Request) -> Option<serde_json::Value> {
+    serde_json::from_slice(&request.body).ok()
+}
+
+fn json_hex_32(body: &serde_json::Value, field: &str) -> Option<[u8; PUBKEY_SIZE]> {
+    hex_decode_32(body.get(field)?.as_str()?)
+}
+
+fn enroll_reject(context: &str, reason: &str) {
+    eprintln!("api enroll: rejected {context}: {reason}");
+}
+
+/// `POST /enroll/begin` — the joining device opens a pairing.
+/// Unauthenticated by design: the device has no credentials yet;
+/// the pairing code it gets back is the capability, and nothing
+/// is enrolled until an approver signs (see
+/// [`handle_enroll_approve`]). Body (JSON): `member_pubkey`,
+/// `device_pubkey`, `display_name`, and `device_cert` (hex of
+/// the member-signed `DeviceCertificate` protobuf the device
+/// made locally — its member key never leaves the device).
+/// Replies `{status:"pending", code, expires_at, ...}`; the
+/// device shows the code to the parent (typed or as a QR/link).
+fn handle_enroll_begin(state: &ApiState, request: &Request) -> Response {
+    let now = now_epoch();
+    let Some(body) = json_body(request) else {
+        enroll_reject("begin", "body is not valid JSON");
+        return Response::json_error(400, "Invalid JSON body");
+    };
+    let Some(member_pubkey) = json_hex_32(&body, "member_pubkey") else {
+        enroll_reject("begin", "missing or invalid member_pubkey");
+        return Response::json_error(400, "Missing or invalid member_pubkey");
+    };
+    let Some(device_pubkey) = json_hex_32(&body, "device_pubkey") else {
+        enroll_reject(
+            &format!("begin member={}", hex_encode(&member_pubkey)),
+            "missing or invalid device_pubkey",
+        );
+        return Response::json_error(400, "Missing or invalid device_pubkey");
+    };
+    let context = format!(
+        "begin member={} device={}",
+        hex_encode(&member_pubkey),
+        hex_encode(&device_pubkey)
+    );
+    let display_name = body
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let display_name = if display_name.is_empty() {
+        "Member".to_string()
+    } else {
+        display_name
+    };
+    let Some(cert_hex) = body.get("device_cert").and_then(|v| v.as_str()) else {
+        enroll_reject(&context, "missing device_cert");
+        return Response::json_error(400, "Missing device_cert");
+    };
+    let Some(cert_bytes) = hex_decode(cert_hex) else {
+        enroll_reject(&context, "device_cert is not hex");
+        return Response::json_error(400, "Invalid device_cert");
+    };
+    let cert = match DeviceCertificate::decode(cert_bytes.as_slice()) {
+        Ok(c) => c,
+        Err(_) => {
+            enroll_reject(&context, "device_cert does not decode");
+            return Response::json_error(400, "Invalid device certificate");
+        }
+    };
+    if cert.member_pubkey != member_pubkey[..] || cert.device_pubkey != device_pubkey[..] {
+        enroll_reject(
+            &context,
+            "device certificate names different keys than the request",
+        );
+        return Response::json_error(
+            400,
+            "Device certificate does not match member/device pubkey",
+        );
+    }
+    let store = state.store.lock().unwrap();
+    match store.device_is_trusted(&member_pubkey, &device_pubkey, now) {
+        Ok(true) => {
+            enroll_reject(&context, "device is already enrolled");
+            return Response::json_error(400, "Device already enrolled");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            enroll_reject(&context, &format!("store error checking device: {e}"));
+            return Response::json_error(500, "Internal error");
+        }
+    }
+    let Some((code, code_hash)) = generate_pairing_code() else {
+        return Response::json_error(500, "Internal error");
+    };
+    let expires_at = now + PAIRING_CODE_TTL_SECONDS;
+    match store.pairing_create(&code_hash, &cert, &display_name, now, expires_at) {
+        Ok(()) => Response::json(
+            200,
+            json!({
+                "status": "pending",
+                "code": code,
+                "expires_at": expires_at,
+                "member_pubkey": hex_encode(&member_pubkey),
+                "device_pubkey": hex_encode(&device_pubkey),
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            // The store verified the certificate before storing;
+            // its rejection reason was logged by `identity`.
+            enroll_reject(&context, &format!("pairing not created: {e}"));
+            Response::json_error(400, "Device certificate rejected")
+        }
+    }
+}
+
+/// `POST /enroll/approve` — an approver completes a pairing.
+/// Body (JSON): `code`, `timestamp`, `signature` (hex), plus
+/// either the parent path (`approver_member_pubkey` +
+/// `approver_device_pubkey`) or the recovery path
+/// (`recovery_pubkey`). The signature is the approver's device
+/// key (or the recovery key) over the enrollment approval
+/// digest, binding the joining member key, device key, and
+/// certificate hash at `timestamp` (see
+/// `crate::identity::enrollment_approval_digest`). On success
+/// the member + device are enrolled atomically and can use the
+/// whole API immediately — one join lights up every feature.
+fn handle_enroll_approve(state: &ApiState, request: &Request) -> Response {
+    let now = now_epoch();
+    let Some(body) = json_body(request) else {
+        enroll_reject("approve", "body is not valid JSON");
+        return Response::json_error(400, "Invalid JSON body");
+    };
+    let Some(code) = body.get("code").and_then(|v| v.as_str()) else {
+        enroll_reject("approve", "missing pairing code");
+        return Response::json_error(400, "Missing pairing code");
+    };
+    let code_hash = pairing_code_hash(code);
+    let Some(timestamp) = body.get("timestamp").and_then(|v| v.as_u64()) else {
+        enroll_reject("approve", "missing or invalid timestamp");
+        return Response::json_error(400, "Missing or invalid timestamp");
+    };
+    let Some(signature) = body
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .and_then(hex_decode)
+        .filter(|s| s.len() == 64)
+    else {
+        enroll_reject("approve", "missing or invalid signature");
+        return Response::json_error(400, "Missing or invalid signature");
+    };
+
+    let store = state.store.lock().unwrap();
+    let record = match store.pairing_get(&code_hash) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            enroll_reject("approve", "unknown pairing code");
+            return Response::json_error(404, "Unknown pairing code");
+        }
+        Err(e) => {
+            enroll_reject("approve", &format!("store error loading pairing: {e}"));
+            return Response::json_error(500, "Internal error");
+        }
+    };
+    let context = format!(
+        "approve member={} device={}",
+        hex_encode(&record.member_pubkey),
+        hex_encode(&record.device_pubkey)
+    );
+    if record.status == "used" {
+        enroll_reject(&context, "pairing code already used");
+        return Response::json_error(400, "Pairing code already used");
+    }
+    if record.status == "expired" || now >= record.expires_at {
+        if record.status == "pending" {
+            let _ = store.pairing_mark_expired(&code_hash);
+        }
+        enroll_reject(&context, "pairing code expired");
+        return Response::json_error(400, "Pairing code expired");
+    }
+    if timestamp > now.saturating_add(REQUEST_FUTURE_SKEW)
+        || timestamp < now.saturating_sub(REQUEST_TIMESTAMP_WINDOW)
+    {
+        enroll_reject(
+            &context,
+            &format!("approval timestamp {timestamp} outside the window at {now}"),
+        );
+        return Response::json_error(400, "Approval timestamp outside window");
+    }
+
+    let parent = (
+        json_hex_32(&body, "approver_member_pubkey"),
+        json_hex_32(&body, "approver_device_pubkey"),
+    );
+    let recovery = json_hex_32(&body, "recovery_pubkey");
+    let approval = match (parent, recovery) {
+        ((Some(approver_member), Some(approver_device)), None) => {
+            // The approver must be an enrolled, active member
+            // standing behind a currently trusted device.
+            if !store.user_exists(&approver_member) {
+                enroll_reject(
+                    &context,
+                    &format!(
+                        "approver member={} is not an enrolled member",
+                        hex_encode(&approver_member)
+                    ),
+                );
+                return Response::json_error(403, "Approver is not an enrolled member");
+            }
+            match store.device_get(&approver_member, &approver_device) {
+                Ok(Some(entry))
+                    if entry.status == crate::store::DeviceStatus::Revoked =>
+                {
+                    enroll_reject(
+                        &context,
+                        &format!(
+                            "approver device={} is revoked",
+                            hex_encode(&approver_device)
+                        ),
+                    );
+                    return Response::json_error(403, "Approver device revoked");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    enroll_reject(&context, &format!("store error loading approver device: {e}"));
+                    return Response::json_error(500, "Internal error");
+                }
+            }
+            match store.device_is_trusted(&approver_member, &approver_device, now) {
+                Ok(true) => {}
+                Ok(false) => {
+                    enroll_reject(
+                        &context,
+                        &format!(
+                            "approver device={} is not a trusted device of the approver",
+                            hex_encode(&approver_device)
+                        ),
+                    );
+                    return Response::json_error(403, "Approver device not trusted");
+                }
+                Err(e) => {
+                    enroll_reject(&context, &format!("store error checking approver device: {e}"));
+                    return Response::json_error(500, "Internal error");
+                }
+            }
+            if let Err(e) = crate::identity::verify_enrollment_approval(
+                &approver_device,
+                &record.member_pubkey,
+                &record.device_pubkey,
+                &record.cert_hash,
+                timestamp,
+                &signature,
+            ) {
+                enroll_reject(&context, &format!("approval signature rejected: {e}"));
+                return Response::json_error(401, "Invalid approval signature");
+            }
+            crate::store::PairingApproval {
+                approver_kind: "parent".to_string(),
+                approver_member_pubkey: Some(approver_member),
+                approver_device_pubkey: Some(approver_device),
+                recovery_pubkey: None,
+                approval_signature: signature,
+                approval_timestamp: timestamp,
+            }
+        }
+        ((None, None), Some(recovery_pubkey)) => {
+            // The printed backup card: its key is a registered
+            // approver in its own right, so a family that lost
+            // every phone still gets back in.
+            match store.recovery_approver_is_registered(&recovery_pubkey) {
+                Ok(true) => {}
+                Ok(false) => {
+                    enroll_reject(
+                        &context,
+                        &format!(
+                            "recovery key={} is not a registered recovery approver",
+                            hex_encode(&recovery_pubkey)
+                        ),
+                    );
+                    return Response::json_error(403, "Unknown recovery key");
+                }
+                Err(e) => {
+                    enroll_reject(&context, &format!("store error checking recovery key: {e}"));
+                    return Response::json_error(500, "Internal error");
+                }
+            }
+            if let Err(e) = crate::identity::verify_enrollment_approval(
+                &recovery_pubkey,
+                &record.member_pubkey,
+                &record.device_pubkey,
+                &record.cert_hash,
+                timestamp,
+                &signature,
+            ) {
+                enroll_reject(&context, &format!("recovery approval signature rejected: {e}"));
+                return Response::json_error(401, "Invalid approval signature");
+            }
+            crate::store::PairingApproval {
+                approver_kind: "recovery".to_string(),
+                approver_member_pubkey: None,
+                approver_device_pubkey: None,
+                recovery_pubkey: Some(recovery_pubkey),
+                approval_signature: signature,
+                approval_timestamp: timestamp,
+            }
+        }
+        _ => {
+            enroll_reject(
+                &context,
+                "body must carry exactly one approver: approver_member_pubkey + approver_device_pubkey, or recovery_pubkey",
+            );
+            return Response::json_error(
+                400,
+                "Provide approver keys or a recovery key",
+            );
+        }
+    };
+
+    match store.pairing_complete(&code_hash, &approval, now) {
+        Ok(crate::store::PairingCompleteOutcome::Completed) => Response::json(
+            200,
+            json!({
+                "status": "approved",
+                "member_pubkey": hex_encode(&record.member_pubkey),
+                "device_pubkey": hex_encode(&record.device_pubkey),
+                "approver": approval.approver_kind,
+            })
+            .to_string(),
+        ),
+        Ok(crate::store::PairingCompleteOutcome::UnknownCode) => {
+            enroll_reject(&context, "pairing vanished before completion");
+            Response::json_error(404, "Unknown pairing code")
+        }
+        Ok(crate::store::PairingCompleteOutcome::AlreadyUsed) => {
+            enroll_reject(&context, "pairing code already used");
+            Response::json_error(400, "Pairing code already used")
+        }
+        Ok(crate::store::PairingCompleteOutcome::Expired) => {
+            enroll_reject(&context, "pairing code expired");
+            Response::json_error(400, "Pairing code expired")
+        }
+        Err(e) => {
+            enroll_reject(&context, &format!("enrollment completion failed: {e}"));
+            Response::json_error(400, "Enrollment could not be completed")
+        }
+    }
+}
+
+/// `GET /enroll/status?code=...` — the joining device polls
+/// its pairing. The code is the capability: knowing it is what
+/// the device proved by displaying it. Replies `pending`,
+/// `approved`, `expired`, or `unknown`.
+fn handle_enroll_status(state: &ApiState, request: &Request) -> Response {
+    let Some(code) = request.query_var("code") else {
+        return Response::json_error(400, "Missing code");
+    };
+    let code_hash = pairing_code_hash(&code);
+    let now = now_epoch();
+    let store = state.store.lock().unwrap();
+    let record = match store.pairing_get(&code_hash) {
+        Ok(r) => r,
+        Err(e) => {
+            enroll_reject("status", &format!("store error loading pairing: {e}"));
+            return Response::json_error(500, "Internal error");
+        }
+    };
+    let Some(mut record) = record else {
+        return Response::json(200, "{\"status\":\"unknown\"}");
+    };
+    if record.status == "pending" && now >= record.expires_at {
+        let _ = store.pairing_mark_expired(&code_hash);
+        record.status = "expired".to_string();
+    }
+    let status = if record.status == "used" {
+        "approved"
+    } else {
+        record.status.as_str()
+    };
+    Response::json(
+        200,
+        json!({
+            "status": status,
+            "member_pubkey": hex_encode(&record.member_pubkey),
+            "device_pubkey": hex_encode(&record.device_pubkey),
+            "expires_at": record.expires_at,
+        })
+        .to_string(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1867,5 +2308,555 @@ mod tests {
                 .unwrap()
                 .contains("invalid signature")
         );
+    }
+
+    // -- enrollment (Phase B3) -----------------------------------
+
+    /// A member + device identity with its member-signed device
+    /// certificate, built the way a joining phone builds it:
+    /// keys generated locally, certificate signed by the member
+    /// key, private keys never leaving the "device".
+    struct TestIdentity {
+        member: SigningKey,
+        device: SigningKey,
+        member_pk: [u8; 32],
+        device_pk: [u8; 32],
+        cert: DeviceCertificate,
+    }
+
+    fn make_identity(member_seed: u8, device_seed: u8, label: &str, issued_at: u64) -> TestIdentity {
+        let member = SigningKey::from_bytes(&[member_seed; 32]);
+        let device = SigningKey::from_bytes(&[device_seed; 32]);
+        let member_pk = member.verifying_key().to_bytes();
+        let device_pk = device.verifying_key().to_bytes();
+        let mut ks = crate::keystore::Keystore::new();
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&member.to_bytes());
+        secret[32..].copy_from_slice(&member_pk);
+        ks.load_raw_ed25519_keypair(&secret).unwrap();
+        let cert =
+            crate::identity::create_device_certificate(&ks, &device_pk, label, issued_at, 0)
+                .unwrap();
+        TestIdentity {
+            member,
+            device,
+            member_pk,
+            device_pk,
+            cert,
+        }
+    }
+
+    fn empty_state() -> ApiState {
+        let store = Store::open_in_memory().unwrap();
+        store.init_schema().unwrap();
+        ApiState::new(
+            Arc::new(Mutex::new(store)),
+            None,
+            GossipValidationConfig {
+                max_clock_skew_seconds: 300,
+                message_ttl_seconds: 30 * 24 * 60 * 60,
+                max_payload_bytes: 1024 * 1024,
+            },
+        )
+    }
+
+    /// The founding household at the store level (what the
+    /// `bootstrap-founder` CLI writes): founder member + device
+    /// enrolled, recovery key registered as an approver.
+    fn seed_founder(state: &ApiState, founder: &TestIdentity, recovery_pk: &[u8; 32], now: u64) {
+        let store = state.store.lock().unwrap();
+        store.user_register(&founder.member_pk, "Founder").unwrap();
+        store.device_add(&founder.cert, now).unwrap();
+        store
+            .recovery_approver_add(recovery_pk, "backup card", now)
+            .unwrap();
+    }
+
+    fn enroll_begin(state: &ApiState, id: &TestIdentity, name: &str) -> (u16, serde_json::Value) {
+        let mut req = bare_request("POST", "/enroll/begin");
+        req.body = json!({
+            "member_pubkey": hex_encode(&id.member_pk),
+            "device_pubkey": hex_encode(&id.device_pk),
+            "display_name": name,
+            "device_cert": hex_encode(&id.cert.encode_to_vec()),
+        })
+        .to_string()
+        .into_bytes();
+        let resp = handle_request(state, &req);
+        let value: serde_json::Value =
+            serde_json::from_slice(&resp.body).unwrap_or(serde_json::Value::Null);
+        (resp.status, value)
+    }
+
+    fn enroll_status(state: &ApiState, code: &str) -> String {
+        let mut req = bare_request("GET", "/enroll/status");
+        req.query = format!("code={code}");
+        let resp = handle_request(state, &req);
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        v["status"].as_str().unwrap().to_string()
+    }
+
+    fn approve_with_body(state: &ApiState, body: serde_json::Value) -> Response {
+        let mut req = bare_request("POST", "/enroll/approve");
+        req.body = body.to_string().into_bytes();
+        handle_request(state, &req)
+    }
+
+    /// A parent approval: the approver's device key signs the
+    /// enrollment approval digest for `target`'s certificate.
+    fn approve_as_parent(
+        state: &ApiState,
+        code: &str,
+        approver: &TestIdentity,
+        target: &TestIdentity,
+        timestamp: u64,
+    ) -> Response {
+        let cert_hash: [u8; 32] = Sha256::digest(target.cert.encode_to_vec()).into();
+        let digest = crate::identity::enrollment_approval_digest(
+            &target.member_pk,
+            &target.device_pk,
+            &cert_hash,
+            timestamp,
+        );
+        let signature = approver.device.sign(&digest).to_bytes();
+        approve_with_body(
+            state,
+            json!({
+                "code": code,
+                "timestamp": timestamp,
+                "signature": hex_encode(&signature),
+                "approver_member_pubkey": hex_encode(&approver.member_pk),
+                "approver_device_pubkey": hex_encode(&approver.device_pk),
+            }),
+        )
+    }
+
+    /// A recovery approval: the backup-card key signs the same
+    /// digest (what the other parent being unreachable looks
+    /// like — and also how a replacement member gets in).
+    fn approve_as_recovery(
+        state: &ApiState,
+        code: &str,
+        recovery: &SigningKey,
+        target: &TestIdentity,
+        timestamp: u64,
+    ) -> Response {
+        let cert_hash: [u8; 32] = Sha256::digest(target.cert.encode_to_vec()).into();
+        let digest = crate::identity::enrollment_approval_digest(
+            &target.member_pk,
+            &target.device_pk,
+            &cert_hash,
+            timestamp,
+        );
+        let signature = recovery.sign(&digest).to_bytes();
+        approve_with_body(
+            state,
+            json!({
+                "code": code,
+                "timestamp": timestamp,
+                "signature": hex_encode(&signature),
+                "recovery_pubkey": hex_encode(&recovery.verifying_key().to_bytes()),
+            }),
+        )
+    }
+
+    fn founder_and_state() -> (ApiState, TestIdentity, SigningKey) {
+        let now = now_epoch();
+        let state = empty_state();
+        let founder = make_identity(11, 12, "phone", now);
+        let recovery = SigningKey::from_bytes(&[99u8; 32]);
+        seed_founder(
+            &state,
+            &founder,
+            &recovery.verifying_key().to_bytes(),
+            now,
+        );
+        (state, founder, recovery)
+    }
+
+    #[test]
+    fn enroll_happy_path_new_member_can_immediately_use_the_api() {
+        let (state, founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+
+        let (status, begin) = enroll_begin(&state, &newcomer, "New Member");
+        assert_eq!(status, 200, "begin body: {begin}");
+        assert_eq!(begin["status"], "pending");
+        let code = begin["code"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 32);
+        assert_eq!(enroll_status(&state, &code), "pending");
+        // Not enrolled yet: signed API calls still fail auth.
+        let req = signed_request(
+            &newcomer.member,
+            &newcomer.member_pk,
+            "GET",
+            "/users",
+            "",
+            now_epoch(),
+        );
+        assert_eq!(handle_request(&state, &req).status, 401);
+
+        let resp = approve_as_parent(&state, &code, &founder, &newcomer, now_epoch());
+        assert_eq!(
+            resp.status, 200,
+            "approve body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["approver"], "parent");
+        assert_eq!(enroll_status(&state, &code), "approved");
+
+        // The audit record carries the approval binding.
+        {
+            let store = state.store.lock().unwrap();
+            let enrollments = store
+                .enrollments_for_member(&newcomer.member_pk)
+                .unwrap();
+            assert_eq!(enrollments.len(), 1);
+            assert_eq!(enrollments[0].approver_kind, "parent");
+            assert_eq!(
+                enrollments[0].approver_member_pubkey,
+                Some(founder.member_pk)
+            );
+            assert_eq!(
+                enrollments[0].approver_device_pubkey,
+                Some(founder.device_pk)
+            );
+            assert_eq!(enrollments[0].approval_signature.len(), 64);
+            assert!(store
+                .device_is_trusted(&newcomer.member_pk, &newcomer.device_pk, now_epoch())
+                .unwrap());
+        }
+
+        // One join, everything works: user list...
+        let req = signed_request(
+            &newcomer.member,
+            &newcomer.member_pk,
+            "GET",
+            "/users",
+            "",
+            now_epoch(),
+        );
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 200);
+        assert!(String::from_utf8(resp.body)
+            .unwrap()
+            .contains("New Member"));
+
+        // ...message submit...
+        let mut msg = Message {
+            header: Some(crate::proto::MessageHeader {
+                version: 1,
+                timestamp: now_epoch(),
+                sender_pubkey: newcomer.member_pk.to_vec(),
+                recipients_pubkey: vec![newcomer.member_pk.to_vec()],
+                group_id: Vec::new(),
+            }),
+            payload_nonce: vec![9u8; 24],
+            ephemeral_pubkey: vec![8u8; 32],
+            payload_ciphertext: b"hello from the new member".to_vec(),
+            keywraps: Vec::new(),
+            signature: Vec::new(),
+        };
+        let digest = validation::compute_message_signing_digest(&msg).unwrap();
+        msg.signature = newcomer.member.sign(&digest).to_bytes().to_vec();
+        let mut req = signed_request(
+            &newcomer.member,
+            &newcomer.member_pk,
+            "POST",
+            "/messages/submit",
+            "",
+            now_epoch(),
+        );
+        req.body = msg.encode_to_vec();
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 202,
+            "submit body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+
+        // ...and location.
+        let env = build_location_envelope(
+            &newcomer.member,
+            &newcomer.member_pk,
+            now_epoch(),
+            false,
+        );
+        let mut req = signed_request(
+            &newcomer.member,
+            &newcomer.member_pk,
+            "POST",
+            "/location/update",
+            "",
+            now_epoch(),
+        );
+        req.body = env.encode_to_vec();
+        let resp = handle_request(&state, &req);
+        assert_eq!(
+            resp.status, 202,
+            "location body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let path = format!("/location/{}", hex_encode(&newcomer.member_pk));
+        let req = signed_request(
+            &newcomer.member,
+            &newcomer.member_pk,
+            "GET",
+            &path,
+            "",
+            now_epoch(),
+        );
+        assert_eq!(handle_request(&state, &req).status, 200);
+    }
+
+    #[test]
+    fn enroll_new_device_for_existing_member() {
+        let (state, founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let member = make_identity(21, 22, "phone", now);
+        let (status, begin) = enroll_begin(&state, &member, "Member");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        let resp = approve_as_parent(&state, &code, &founder, &member, now_epoch());
+        assert_eq!(resp.status, 200);
+
+        // Same member key, second device (new cert), same flow.
+        let second = make_identity(21, 23, "tablet", now_epoch());
+        assert_eq!(second.member_pk, member.member_pk);
+        assert_ne!(second.device_pk, member.device_pk);
+        let (status, begin) = enroll_begin(&state, &second, "Member");
+        assert_eq!(status, 200, "begin body: {begin}");
+        let code = begin["code"].as_str().unwrap().to_string();
+        let resp = approve_as_parent(&state, &code, &founder, &second, now_epoch());
+        assert_eq!(
+            resp.status, 200,
+            "approve body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let store = state.store.lock().unwrap();
+        assert!(store
+            .device_is_trusted(&member.member_pk, &member.device_pk, now_epoch())
+            .unwrap());
+        assert!(store
+            .device_is_trusted(&second.member_pk, &second.device_pk, now_epoch())
+            .unwrap());
+        assert_eq!(store.device_list(&member.member_pk).unwrap().len(), 2);
+        assert_eq!(store.enrollments_for_member(&member.member_pk).unwrap().len(), 2);
+        // Still exactly one user row for the member.
+        assert_eq!(store.user_count().unwrap(), 2); // founder + member
+    }
+
+    #[test]
+    fn enroll_expired_code_is_rejected() {
+        let (state, founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+        let (status, begin) = enroll_begin(&state, &newcomer, "Late");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        // Force the pairing past its expiry (the 10-minute TTL
+        // is too long to wait out in a test).
+        {
+            let store = state.store.lock().unwrap();
+            store
+                .connection()
+                .execute(
+                    "UPDATE pairing_codes SET expires_at = 1",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(enroll_status(&state, &code), "expired");
+        let resp = approve_as_parent(&state, &code, &founder, &newcomer, now_epoch());
+        assert_eq!(resp.status, 400);
+        assert!(String::from_utf8(resp.body)
+            .unwrap()
+            .contains("Pairing code expired"));
+        let store = state.store.lock().unwrap();
+        assert!(!store.user_exists(&newcomer.member_pk));
+    }
+
+    #[test]
+    fn enroll_code_reuse_is_rejected() {
+        let (state, founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+        let (status, begin) = enroll_begin(&state, &newcomer, "Member");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        let resp = approve_as_parent(&state, &code, &founder, &newcomer, now_epoch());
+        assert_eq!(resp.status, 200);
+        // A second approval with a fresh signature changes
+        // nothing: the code is spent.
+        let resp = approve_as_parent(&state, &code, &founder, &newcomer, now_epoch());
+        assert_eq!(resp.status, 400);
+        assert!(String::from_utf8(resp.body)
+            .unwrap()
+            .contains("Pairing code already used"));
+        // Unknown codes are a distinct, visible failure.
+        let resp = approve_as_parent(
+            &state,
+            "00000000000000000000000000000000",
+            &founder,
+            &newcomer,
+            now_epoch(),
+        );
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn enroll_unenrolled_approver_is_rejected() {
+        let (state, _founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+        let (status, begin) = enroll_begin(&state, &newcomer, "Member");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        // The stranger's keys are well-formed and the signature
+        // is valid — but the stranger is not an enrolled member.
+        let stranger = make_identity(41, 42, "phone", now);
+        let resp = approve_as_parent(&state, &code, &stranger, &newcomer, now_epoch());
+        assert_eq!(resp.status, 403);
+        assert!(String::from_utf8(resp.body)
+            .unwrap()
+            .contains("Approver is not an enrolled member"));
+        let store = state.store.lock().unwrap();
+        assert!(!store.user_exists(&newcomer.member_pk));
+    }
+
+    #[test]
+    fn enroll_revoked_approver_device_is_rejected() {
+        let (state, founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+        let (status, begin) = enroll_begin(&state, &newcomer, "Member");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        // The founder's phone is lost and its device revoked
+        // before it can approve anything.
+        {
+            let store = state.store.lock().unwrap();
+            assert!(store
+                .device_revoke(&founder.member_pk, &founder.device_pk, now_epoch())
+                .unwrap());
+        }
+        let resp = approve_as_parent(&state, &code, &founder, &newcomer, now_epoch());
+        assert_eq!(resp.status, 403);
+        assert!(String::from_utf8(resp.body)
+            .unwrap()
+            .contains("Approver device revoked"));
+        let store = state.store.lock().unwrap();
+        assert!(!store.user_exists(&newcomer.member_pk));
+    }
+
+    #[test]
+    fn enroll_recovery_key_can_approve_a_replacement_member() {
+        let (state, _founder, recovery) = founder_and_state();
+        let now = now_epoch();
+        // Both parents lost their phones: a brand-new member
+        // identity gets in on the backup card alone.
+        let replacement = make_identity(51, 52, "phone", now);
+        let (status, begin) = enroll_begin(&state, &replacement, "Replacement");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        let resp = approve_as_recovery(&state, &code, &recovery, &replacement, now_epoch());
+        assert_eq!(
+            resp.status, 200,
+            "approve body: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["approver"], "recovery");
+        let store = state.store.lock().unwrap();
+        assert!(store.user_exists(&replacement.member_pk));
+        let enrollments = store
+            .enrollments_for_member(&replacement.member_pk)
+            .unwrap();
+        assert_eq!(enrollments.len(), 1);
+        assert_eq!(enrollments[0].approver_kind, "recovery");
+        assert_eq!(
+            enrollments[0].recovery_pubkey,
+            Some(recovery.verifying_key().to_bytes())
+        );
+        drop(store);
+
+        // An unregistered "recovery" key approves nothing.
+        let bogus = SigningKey::from_bytes(&[77u8; 32]);
+        let another = make_identity(61, 62, "phone", now_epoch());
+        let (status, begin) = enroll_begin(&state, &another, "Another");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        let resp = approve_as_recovery(&state, &code, &bogus, &another, now_epoch());
+        assert_eq!(resp.status, 403);
+        assert!(String::from_utf8(resp.body)
+            .unwrap()
+            .contains("Unknown recovery key"));
+    }
+
+    #[test]
+    fn enroll_bad_approval_signature_is_rejected() {
+        let (state, founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+        let (status, begin) = enroll_begin(&state, &newcomer, "Member");
+        assert_eq!(status, 200);
+        let code = begin["code"].as_str().unwrap().to_string();
+        // The approver fields name the founder, but the
+        // signature comes from a different device key.
+        let impostor_device = SigningKey::from_bytes(&[55u8; 32]);
+        let cert_hash: [u8; 32] = Sha256::digest(newcomer.cert.encode_to_vec()).into();
+        let timestamp = now_epoch();
+        let digest = crate::identity::enrollment_approval_digest(
+            &newcomer.member_pk,
+            &newcomer.device_pk,
+            &cert_hash,
+            timestamp,
+        );
+        let signature = impostor_device.sign(&digest).to_bytes();
+        let resp = approve_with_body(
+            &state,
+            json!({
+                "code": code,
+                "timestamp": timestamp,
+                "signature": hex_encode(&signature),
+                "approver_member_pubkey": hex_encode(&founder.member_pk),
+                "approver_device_pubkey": hex_encode(&founder.device_pk),
+            }),
+        );
+        assert_eq!(resp.status, 401);
+        let store = state.store.lock().unwrap();
+        assert!(!store.user_exists(&newcomer.member_pk));
+    }
+
+    #[test]
+    fn enroll_begin_rejects_a_certificate_that_does_not_match() {
+        let (state, _founder, _recovery) = founder_and_state();
+        let now = now_epoch();
+        let newcomer = make_identity(21, 22, "phone", now);
+        let other = make_identity(31, 32, "phone", now);
+        // Body names the newcomer but carries someone else's
+        // certificate: rejected before any pairing exists.
+        let mut req = bare_request("POST", "/enroll/begin");
+        req.body = json!({
+            "member_pubkey": hex_encode(&newcomer.member_pk),
+            "device_pubkey": hex_encode(&newcomer.device_pk),
+            "display_name": "Mismatch",
+            "device_cert": hex_encode(&other.cert.encode_to_vec()),
+        })
+        .to_string()
+        .into_bytes();
+        let resp = handle_request(&state, &req);
+        assert_eq!(resp.status, 400);
+        let store = state.store.lock().unwrap();
+        store.pairings_init().unwrap();
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM pairing_codes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

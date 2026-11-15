@@ -438,6 +438,112 @@ pub struct DeviceEntry {
     pub updated_at: u64,
 }
 
+/// One row of the `pairing_codes` table (Phase B3 enrollment,
+/// DESIGN.md §3.2/§4.2): a pending join request. The table is
+/// server-side only and never gossiped; the code itself is never
+/// stored, only its SHA-256 (`code_hash`), so a database leak
+/// does not leak usable codes. A pairing is created by the
+/// joining device's `/enroll/begin`, completed exactly once by
+/// an approved `/enroll/approve`, and otherwise dies at
+/// `expires_at` (~10 minutes after creation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRecord {
+    /// SHA-256 of the pairing code (the lookup key).
+    pub code_hash: [u8; 32],
+    /// The joining member key (from the device certificate).
+    pub member_pubkey: [u8; PUBKEY_SIZE],
+    /// The joining device key (from the device certificate).
+    pub device_pubkey: [u8; PUBKEY_SIZE],
+    /// Display name the member will be registered under.
+    pub display_name: String,
+    /// Serialized `DeviceCertificate` protobuf, as submitted.
+    pub cert: Vec<u8>,
+    /// SHA-256 of `cert` (the value approvals bind).
+    pub cert_hash: [u8; 32],
+    /// `pending`, `used`, or `expired`.
+    pub status: String,
+    /// Pairing creation time (epoch seconds).
+    pub created_at: u64,
+    /// Pairing expiry (epoch seconds); approvals at or after
+    /// this instant are rejected.
+    pub expires_at: u64,
+    /// When the pairing was completed, if it was.
+    pub used_at: Option<u64>,
+}
+
+/// One row of the `enrollments` table (Phase B3): the audit
+/// record of one completed enrollment — the UserRegistration
+/// (content type 1) and device certificate (content type 3) a
+/// member/device pair entered the household with, and who
+/// authorized it. For a parent approval, `approval_signature`
+/// is the approver's device key over the enrollment approval
+/// digest (see `crate::identity::enrollment_approval_digest`);
+/// for a recovery approval it is the household recovery key's
+/// signature over the same digest; for the founding bootstrap
+/// (`approver_kind = "founder"`) there is no approver and the
+/// signature is empty — the setup-time CLI is the authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentRecord {
+    /// Row id (0 before insertion).
+    pub id: i64,
+    /// The enrolled member key.
+    pub member_pubkey: [u8; PUBKEY_SIZE],
+    /// The enrolled device key.
+    pub device_pubkey: [u8; PUBKEY_SIZE],
+    /// SHA-256 of the enrolled device certificate.
+    pub cert_hash: [u8; 32],
+    /// `founder`, `parent`, or `recovery`.
+    pub approver_kind: String,
+    /// Approving parent's member key (parent approvals only).
+    pub approver_member_pubkey: Option<[u8; PUBKEY_SIZE]>,
+    /// Approving parent's device key (parent approvals only).
+    pub approver_device_pubkey: Option<[u8; PUBKEY_SIZE]>,
+    /// Household recovery key (recovery approvals only).
+    pub recovery_pubkey: Option<[u8; PUBKEY_SIZE]>,
+    /// The approval signature over the enrollment approval
+    /// digest (empty for the founding bootstrap).
+    pub approval_signature: Vec<u8>,
+    /// Timestamp the approval signature covers.
+    pub approval_timestamp: u64,
+    /// When the enrollment completed (epoch seconds).
+    pub created_at: u64,
+}
+
+/// The approver half of a pairing completion, handed to
+/// [`Store::pairing_complete`] after the API layer has verified
+/// the approval signature and the approver's standing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingApproval {
+    /// `parent` or `recovery`.
+    pub approver_kind: String,
+    /// Approving parent's member key (parent approvals only).
+    pub approver_member_pubkey: Option<[u8; PUBKEY_SIZE]>,
+    /// Approving parent's device key (parent approvals only).
+    pub approver_device_pubkey: Option<[u8; PUBKEY_SIZE]>,
+    /// Household recovery key (recovery approvals only).
+    pub recovery_pubkey: Option<[u8; PUBKEY_SIZE]>,
+    /// The verified approval signature, stored as evidence.
+    pub approval_signature: Vec<u8>,
+    /// Timestamp the approval signature covers.
+    pub approval_timestamp: u64,
+}
+
+/// Outcome of [`Store::pairing_complete`]: the completion is
+/// atomic, so a pairing either enrolls fully or not at all, and
+/// a code completes at most once however many approvals race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingCompleteOutcome {
+    /// User row, device row, and enrollment record written;
+    /// the pairing is now `used`.
+    Completed,
+    /// No pairing exists for the code hash.
+    UnknownCode,
+    /// The pairing was already completed.
+    AlreadyUsed,
+    /// The pairing expired before completion.
+    Expired,
+}
+
 /// One row of the C `nodes` table (`nodes_get_by_id` out-params).
 /// Nullable text columns surface as empty strings, as in C.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,6 +648,9 @@ const CREATE_IDX_PEERS_PUBKEY: &str =
     "CREATE INDEX IF NOT EXISTS idx_gossip_peers_node_pubkey ON gossip_peers(node_pubkey);";
 const CREATE_NODE_TRUST: &str = "CREATE TABLE IF NOT EXISTS node_trust ( node_pubkey BLOB PRIMARY KEY, hostname TEXT, trusted_at INTEGER NOT NULL, source TEXT NOT NULL DEFAULT '');";
 const CREATE_DEVICES: &str = "CREATE TABLE IF NOT EXISTS devices ( member_pubkey BLOB NOT NULL, device_pubkey BLOB NOT NULL, label TEXT NOT NULL DEFAULT '', cert BLOB NOT NULL, cert_hash BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'active', issued_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, revoked_at INTEGER, created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), PRIMARY KEY (member_pubkey, device_pubkey));";
+const CREATE_PAIRING_CODES: &str = "CREATE TABLE IF NOT EXISTS pairing_codes ( code_hash BLOB PRIMARY KEY, member_pubkey BLOB NOT NULL, device_pubkey BLOB NOT NULL, display_name TEXT NOT NULL DEFAULT '', cert BLOB NOT NULL, cert_hash BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER);";
+const CREATE_ENROLLMENTS: &str = "CREATE TABLE IF NOT EXISTS enrollments ( id INTEGER PRIMARY KEY AUTOINCREMENT, member_pubkey BLOB NOT NULL, device_pubkey BLOB NOT NULL, cert_hash BLOB NOT NULL, approver_kind TEXT NOT NULL, approver_member_pubkey BLOB, approver_device_pubkey BLOB, recovery_pubkey BLOB, approval_signature BLOB NOT NULL, approval_timestamp INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);";
+const CREATE_RECOVERY_APPROVERS: &str = "CREATE TABLE IF NOT EXISTS recovery_approvers ( recovery_pubkey BLOB PRIMARY KEY, label TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);";
 
 /// Statements of `gossip_store_init`, in C execution order.
 const GOSSIP_SCHEMA: &[&str] = &[
@@ -1858,21 +1967,7 @@ impl Store {
         // Verification has established both pubkeys are 32 bytes.
         let cert_bytes = cert.encode_to_vec();
         let cert_hash: [u8; 32] = Sha256::digest(&cert_bytes).into();
-        self.conn.execute(
-            "INSERT INTO devices (member_pubkey, device_pubkey, label, cert, cert_hash, status, issued_at, expires_at, revoked_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?) ON CONFLICT(member_pubkey, device_pubkey) DO UPDATE SET label=excluded.label, cert=excluded.cert, cert_hash=excluded.cert_hash, status='active', issued_at=excluded.issued_at, expires_at=excluded.expires_at, revoked_at=NULL, updated_at=excluded.updated_at",
-            params![
-                &cert.member_pubkey[..],
-                &cert.device_pubkey[..],
-                cert.label,
-                cert_bytes,
-                &cert_hash[..],
-                cert.issued_at as i64,
-                cert.expires_at as i64,
-                now as i64,
-                now as i64,
-            ],
-        )?;
-        Ok(())
+        insert_device_row(&self.conn, cert, &cert_bytes, &cert_hash, now)
     }
 
     /// The recorded device for (member, device), `Ok(None)` when
@@ -1997,6 +2092,252 @@ impl Store {
             return Ok(false);
         }
         Ok(crate::identity::verify_device_certificate(&cert, now).is_ok())
+    }
+
+    // -- enrollment (Phase B3, DESIGN.md §3.2) --------------------
+
+    /// Create the `pairing_codes` table if needed (lazy, like
+    /// [`Store::devices_init`]).
+    pub fn pairings_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_PAIRING_CODES)?;
+        Ok(())
+    }
+
+    /// Create the `enrollments` table if needed.
+    pub fn enrollments_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_ENROLLMENTS)?;
+        Ok(())
+    }
+
+    /// Create the `recovery_approvers` table if needed.
+    pub fn recovery_approvers_init(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_RECOVERY_APPROVERS)?;
+        Ok(())
+    }
+
+    /// Open a pending pairing for a joining device (the store
+    /// half of `/enroll/begin`). The certificate is verified
+    /// first — signature and expiry at `now` — and an invalid
+    /// one is rejected (the `identity` module logs the reason)
+    /// and never stored. `code_hash` is the SHA-256 of the code
+    /// the joining device displays; the code itself is never
+    /// stored. Opening a new pairing for a (member, device)
+    /// pair retires any earlier still-pending pairing for the
+    /// same pair, so only the freshest code can complete.
+    pub fn pairing_create(
+        &self,
+        code_hash: &[u8; 32],
+        cert: &DeviceCertificate,
+        display_name: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<()> {
+        self.pairings_init()?;
+        crate::identity::verify_device_certificate(cert, now).map_err(|e| {
+            invalid(&format!("device certificate rejected: {e}"))
+        })?;
+        // Verification has established both pubkeys are 32 bytes.
+        let cert_bytes = cert.encode_to_vec();
+        let cert_hash: [u8; 32] = Sha256::digest(&cert_bytes).into();
+        self.conn.execute(
+            "UPDATE pairing_codes SET status='expired' WHERE member_pubkey = ? AND device_pubkey = ? AND status = 'pending'",
+            params![&cert.member_pubkey[..], &cert.device_pubkey[..]],
+        )?;
+        self.conn.execute(
+            "INSERT INTO pairing_codes (code_hash, member_pubkey, device_pubkey, display_name, cert, cert_hash, status, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)",
+            params![
+                &code_hash[..],
+                &cert.member_pubkey[..],
+                &cert.device_pubkey[..],
+                display_name,
+                cert_bytes,
+                &cert_hash[..],
+                now as i64,
+                expires_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The pairing recorded for a code hash, `Ok(None)` when the
+    /// code is unknown.
+    pub fn pairing_get(&self, code_hash: &[u8; 32]) -> Result<Option<PairingRecord>> {
+        self.pairings_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT code_hash, member_pubkey, device_pubkey, display_name, cert, cert_hash, status, created_at, expires_at, used_at FROM pairing_codes WHERE code_hash = ?",
+        )?;
+        let mut rows = stmt.query(params![&code_hash[..]])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(pairing_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark a still-pending pairing expired. Returns whether a
+    /// row changed.
+    pub fn pairing_mark_expired(&self, code_hash: &[u8; 32]) -> Result<bool> {
+        self.pairings_init()?;
+        let changed = self.conn.execute(
+            "UPDATE pairing_codes SET status='expired' WHERE code_hash = ? AND status = 'pending'",
+            params![&code_hash[..]],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Complete a pairing atomically (the store half of
+    /// `/enroll/approve`, after the API layer has verified the
+    /// approval signature and the approver's standing): in one
+    /// transaction, register the member (a no-op when the member
+    /// already exists — an existing member is adding a device),
+    /// record the device certificate, write the enrollment
+    /// audit record, and mark the pairing used. The certificate
+    /// is re-verified at completion time, so a certificate that
+    /// lapsed between begin and approve completes nothing.
+    pub fn pairing_complete(
+        &self,
+        code_hash: &[u8; 32],
+        approval: &PairingApproval,
+        now: u64,
+    ) -> Result<PairingCompleteOutcome> {
+        self.pairings_init()?;
+        self.enrollments_init()?;
+        self.devices_init()?;
+        let Some(record) = self.pairing_get(code_hash)? else {
+            return Ok(PairingCompleteOutcome::UnknownCode);
+        };
+        match record.status.as_str() {
+            "used" => return Ok(PairingCompleteOutcome::AlreadyUsed),
+            "expired" => return Ok(PairingCompleteOutcome::Expired),
+            _ => {}
+        }
+        if now >= record.expires_at {
+            let _ = self.pairing_mark_expired(code_hash);
+            return Ok(PairingCompleteOutcome::Expired);
+        }
+        let cert = DeviceCertificate::decode(record.cert.as_slice())
+            .map_err(|e| invalid(&format!("stored pairing certificate does not decode: {e}")))?;
+        crate::identity::verify_device_certificate(&cert, now).map_err(|e| {
+            invalid(&format!("device certificate rejected at completion: {e}"))
+        })?;
+        if cert.member_pubkey != record.member_pubkey[..]
+            || cert.device_pubkey != record.device_pubkey[..]
+        {
+            return Err(invalid(
+                "stored pairing certificate names different keys than the pairing",
+            ));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO users (pubkey, username, is_active) VALUES (?, ?, 1) ON CONFLICT(pubkey) DO NOTHING",
+            params![hex_encode_pubkey(&record.member_pubkey), record.display_name],
+        )?;
+        insert_device_row(&tx, &cert, &record.cert, &record.cert_hash, now)?;
+        insert_enrollment_row(
+            &tx,
+            &EnrollmentRecord {
+                id: 0,
+                member_pubkey: record.member_pubkey,
+                device_pubkey: record.device_pubkey,
+                cert_hash: record.cert_hash,
+                approver_kind: approval.approver_kind.clone(),
+                approver_member_pubkey: approval.approver_member_pubkey,
+                approver_device_pubkey: approval.approver_device_pubkey,
+                recovery_pubkey: approval.recovery_pubkey,
+                approval_signature: approval.approval_signature.clone(),
+                approval_timestamp: approval.approval_timestamp,
+                created_at: now,
+            },
+        )?;
+        let changed = tx.execute(
+            "UPDATE pairing_codes SET status='used', used_at = ? WHERE code_hash = ? AND status = 'pending'",
+            params![now as i64, &code_hash[..]],
+        )?;
+        if changed == 0 {
+            // Another completion won the race between the check
+            // above and this transaction; dropping `tx` rolls
+            // the whole enrollment back.
+            return Ok(PairingCompleteOutcome::AlreadyUsed);
+        }
+        tx.commit()?;
+        Ok(PairingCompleteOutcome::Completed)
+    }
+
+    /// Write an enrollment audit record outside a pairing
+    /// completion — the founding bootstrap's path (its
+    /// enrollments have no pairing and no approver). Returns
+    /// the new row id.
+    pub fn enrollment_insert(&self, record: &EnrollmentRecord) -> Result<i64> {
+        self.enrollments_init()?;
+        insert_enrollment_row(&self.conn, record)
+    }
+
+    /// All enrollment records for a member, oldest first (the
+    /// audit trail of how each of their devices joined).
+    pub fn enrollments_for_member(
+        &self,
+        member_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<Vec<EnrollmentRecord>> {
+        self.enrollments_init()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, member_pubkey, device_pubkey, cert_hash, approver_kind, approver_member_pubkey, approver_device_pubkey, recovery_pubkey, approval_signature, approval_timestamp, created_at FROM enrollments WHERE member_pubkey = ? ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![&member_pubkey[..]], enrollment_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Register a household recovery key (the printed backup
+    /// card's public half) as an enrollment approver. Called by
+    /// the founding bootstrap; the matching secret never touches
+    /// the node.
+    pub fn recovery_approver_add(
+        &self,
+        recovery_pubkey: &[u8; PUBKEY_SIZE],
+        label: &str,
+        now: u64,
+    ) -> Result<()> {
+        self.recovery_approvers_init()?;
+        self.conn.execute(
+            "INSERT INTO recovery_approvers (recovery_pubkey, label, created_at) VALUES (?, ?, ?) ON CONFLICT(recovery_pubkey) DO NOTHING",
+            params![&recovery_pubkey[..], label, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Is this key a registered household recovery approver?
+    pub fn recovery_approver_is_registered(
+        &self,
+        recovery_pubkey: &[u8; PUBKEY_SIZE],
+    ) -> Result<bool> {
+        self.recovery_approvers_init()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM recovery_approvers WHERE recovery_pubkey = ?")?;
+        let mut rows = stmt.query(params![&recovery_pubkey[..]])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Register a user directly (founding bootstrap and tests):
+    /// an active `users` row for `user_pubkey` under `username`.
+    /// A no-op when the pubkey is already registered.
+    pub fn user_register(&self, user_pubkey: &[u8; PUBKEY_SIZE], username: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO users (pubkey, username, is_active) VALUES (?, ?, 1) ON CONFLICT(pubkey) DO NOTHING",
+            params![hex_encode_pubkey(user_pubkey), username],
+        )?;
+        Ok(())
+    }
+
+    /// How many users are registered (any active state). The
+    /// founding bootstrap refuses to run unless this is 0.
+    pub fn user_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        Ok(count as u64)
     }
 
     /// Delete a peer by hostname; returns whether a row was removed.
@@ -2155,6 +2496,117 @@ fn trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeTrustEntry> {
         hostname: row.get(1)?,
         trusted_at: row.get::<_, i64>(2)? as u64,
         source: row.get(3)?,
+    })
+}
+
+/// Copy a blob into a fixed-size array when its length matches
+/// exactly; a wrong-length blob reads as zeroes (the
+/// `device_from_row` idiom, factored out for the enrollment
+/// row mappers).
+fn blob_to_array<const N: usize>(blob: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    if blob.len() == N {
+        out.copy_from_slice(blob);
+    }
+    out
+}
+
+/// [`blob_to_array`] for nullable pubkey columns: NULL (or a
+/// wrong-length blob) reads as `None`.
+fn blob_to_opt_pubkey(blob: Option<Vec<u8>>) -> Option<[u8; PUBKEY_SIZE]> {
+    let blob = blob?;
+    if blob.len() == PUBKEY_SIZE {
+        Some(blob_to_array(&blob))
+    } else {
+        None
+    }
+}
+
+/// Insert (or refresh) a device row from an already-verified
+/// certificate: the write half of [`Store::device_add`], shared
+/// with the enrollment completion transaction so both paths
+/// store exactly the same row.
+fn insert_device_row(
+    conn: &Connection,
+    cert: &DeviceCertificate,
+    cert_bytes: &[u8],
+    cert_hash: &[u8; 32],
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO devices (member_pubkey, device_pubkey, label, cert, cert_hash, status, issued_at, expires_at, revoked_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?) ON CONFLICT(member_pubkey, device_pubkey) DO UPDATE SET label=excluded.label, cert=excluded.cert, cert_hash=excluded.cert_hash, status='active', issued_at=excluded.issued_at, expires_at=excluded.expires_at, revoked_at=NULL, updated_at=excluded.updated_at",
+        params![
+            &cert.member_pubkey[..],
+            &cert.device_pubkey[..],
+            cert.label,
+            cert_bytes,
+            &cert_hash[..],
+            cert.issued_at as i64,
+            cert.expires_at as i64,
+            now as i64,
+            now as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one enrollment audit row; returns its row id. Shared
+/// by [`Store::pairing_complete`] (inside its transaction) and
+/// [`Store::enrollment_insert`] (the founding bootstrap).
+fn insert_enrollment_row(conn: &Connection, record: &EnrollmentRecord) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO enrollments (member_pubkey, device_pubkey, cert_hash, approver_kind, approver_member_pubkey, approver_device_pubkey, recovery_pubkey, approval_signature, approval_timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            &record.member_pubkey[..],
+            &record.device_pubkey[..],
+            &record.cert_hash[..],
+            record.approver_kind,
+            record.approver_member_pubkey.as_ref().map(|k| &k[..]),
+            record.approver_device_pubkey.as_ref().map(|k| &k[..]),
+            record.recovery_pubkey.as_ref().map(|k| &k[..]),
+            record.approval_signature,
+            record.approval_timestamp as i64,
+            record.created_at as i64,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn pairing_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PairingRecord> {
+    let code_blob: Vec<u8> = row.get(0)?;
+    let member_blob: Vec<u8> = row.get(1)?;
+    let device_blob: Vec<u8> = row.get(2)?;
+    let hash_blob: Vec<u8> = row.get(5)?;
+    Ok(PairingRecord {
+        code_hash: blob_to_array(&code_blob),
+        member_pubkey: blob_to_array(&member_blob),
+        device_pubkey: blob_to_array(&device_blob),
+        display_name: row.get(3)?,
+        cert: row.get(4)?,
+        cert_hash: blob_to_array(&hash_blob),
+        status: row.get(6)?,
+        created_at: row.get::<_, i64>(7)? as u64,
+        expires_at: row.get::<_, i64>(8)? as u64,
+        used_at: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+    })
+}
+
+fn enrollment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnrollmentRecord> {
+    let member_blob: Vec<u8> = row.get(1)?;
+    let device_blob: Vec<u8> = row.get(2)?;
+    let hash_blob: Vec<u8> = row.get(3)?;
+    Ok(EnrollmentRecord {
+        id: row.get(0)?,
+        member_pubkey: blob_to_array(&member_blob),
+        device_pubkey: blob_to_array(&device_blob),
+        cert_hash: blob_to_array(&hash_blob),
+        approver_kind: row.get(4)?,
+        approver_member_pubkey: blob_to_opt_pubkey(row.get(5)?),
+        approver_device_pubkey: blob_to_opt_pubkey(row.get(6)?),
+        recovery_pubkey: blob_to_opt_pubkey(row.get(7)?),
+        approval_signature: row.get(8)?,
+        approval_timestamp: row.get::<_, i64>(9)? as u64,
+        created_at: row.get::<_, i64>(10)? as u64,
     })
 }
 
@@ -3130,6 +3582,163 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn parent_approval() -> PairingApproval {
+        PairingApproval {
+            approver_kind: "parent".to_string(),
+            approver_member_pubkey: Some([0xAA; 32]),
+            approver_device_pubkey: Some([0xBB; 32]),
+            recovery_pubkey: None,
+            approval_signature: vec![0x0A; 64],
+            approval_timestamp: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn pairing_create_get_and_fresh_begin_retires_prior_code() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (_member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+        let hash_a = [0xA1; 32];
+        let hash_b = [0xB2; 32];
+
+        assert!(store.pairing_get(&hash_a).unwrap().is_none());
+        store
+            .pairing_create(&hash_a, &cert, "New Member", NOW, NOW + 600)
+            .unwrap();
+        let record = store.pairing_get(&hash_a).unwrap().unwrap();
+        assert_eq!(record.member_pubkey, member_pk);
+        assert_eq!(record.device_pubkey, device_pk);
+        assert_eq!(record.display_name, "New Member");
+        assert_eq!(record.status, "pending");
+        assert_eq!(record.expires_at, NOW + 600);
+        assert_eq!(record.used_at, None);
+        let cert_bytes = cert.encode_to_vec();
+        assert_eq!(record.cert, cert_bytes);
+        let expected_hash: [u8; 32] = Sha256::digest(&cert_bytes).into();
+        assert_eq!(record.cert_hash, expected_hash);
+
+        // A fresh begin for the same (member, device) retires
+        // the earlier pending code: only the newest can complete.
+        store
+            .pairing_create(&hash_b, &cert, "New Member", NOW + 1, NOW + 601)
+            .unwrap();
+        assert_eq!(
+            store.pairing_get(&hash_a).unwrap().unwrap().status,
+            "expired"
+        );
+        assert_eq!(
+            store.pairing_complete(&hash_a, &parent_approval(), NOW + 2)
+                .unwrap(),
+            PairingCompleteOutcome::Expired
+        );
+        assert_eq!(
+            store.pairing_get(&hash_b).unwrap().unwrap().status,
+            "pending"
+        );
+
+        // A tampered certificate is rejected at create and
+        // never stored.
+        let mut forged = cert.clone();
+        forged.label = "forged".to_string();
+        assert!(store
+            .pairing_create(&[0xC3; 32], &forged, "Forged", NOW, NOW + 600)
+            .is_err());
+        assert!(store.pairing_get(&[0xC3; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn pairing_complete_enrolls_atomically_and_only_once() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (_member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+        let code_hash = [0xD4; 32];
+        store
+            .pairing_create(&code_hash, &cert, "New Member", NOW, NOW + 600)
+            .unwrap();
+
+        // Unknown codes complete nothing.
+        assert_eq!(
+            store
+                .pairing_complete(&[0xFF; 32], &parent_approval(), NOW + 1)
+                .unwrap(),
+            PairingCompleteOutcome::UnknownCode
+        );
+        assert!(!store.user_exists(&member_pk));
+
+        assert_eq!(
+            store
+                .pairing_complete(&code_hash, &parent_approval(), NOW + 1)
+                .unwrap(),
+            PairingCompleteOutcome::Completed
+        );
+        // Everything landed together: user row, trusted device,
+        // audit record, pairing marked used.
+        assert!(store.user_exists(&member_pk));
+        assert!(store.device_is_trusted(&member_pk, &device_pk, NOW + 1).unwrap());
+        let record = store.pairing_get(&code_hash).unwrap().unwrap();
+        assert_eq!(record.status, "used");
+        assert_eq!(record.used_at, Some(NOW + 1));
+        let enrollments = store.enrollments_for_member(&member_pk).unwrap();
+        assert_eq!(enrollments.len(), 1);
+        assert_eq!(enrollments[0].approver_kind, "parent");
+        assert_eq!(
+            enrollments[0].approver_member_pubkey,
+            Some([0xAA; 32])
+        );
+        assert_eq!(
+            enrollments[0].approver_device_pubkey,
+            Some([0xBB; 32])
+        );
+        assert_eq!(enrollments[0].recovery_pubkey, None);
+        assert_eq!(enrollments[0].cert_hash, record.cert_hash);
+
+        // The same code never completes twice.
+        assert_eq!(
+            store
+                .pairing_complete(&code_hash, &parent_approval(), NOW + 2)
+                .unwrap(),
+            PairingCompleteOutcome::AlreadyUsed
+        );
+        assert_eq!(store.enrollments_for_member(&member_pk).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pairing_complete_after_expiry_enrolls_nothing() {
+        const NOW: u64 = 1_700_000_000;
+        let store = test_store();
+        let (_member, cert, member_pk, device_pk) = member_with_cert("phone", NOW);
+        let code_hash = [0xE5; 32];
+        store
+            .pairing_create(&code_hash, &cert, "Late Member", NOW, NOW + 600)
+            .unwrap();
+        assert_eq!(
+            store
+                .pairing_complete(&code_hash, &parent_approval(), NOW + 600)
+                .unwrap(),
+            PairingCompleteOutcome::Expired
+        );
+        assert!(!store.user_exists(&member_pk));
+        assert!(!store.device_is_trusted(&member_pk, &device_pk, NOW).unwrap());
+        assert!(store.enrollments_for_member(&member_pk).unwrap().is_empty());
+        assert_eq!(
+            store.pairing_get(&code_hash).unwrap().unwrap().status,
+            "expired"
+        );
+    }
+
+    #[test]
+    fn recovery_approver_registration() {
+        let store = test_store();
+        let key = [0x42; 32];
+        assert!(!store.recovery_approver_is_registered(&key).unwrap());
+        store.recovery_approver_add(&key, "backup card", 1_700_000_000).unwrap();
+        assert!(store.recovery_approver_is_registered(&key).unwrap());
+        assert!(!store.recovery_approver_is_registered(&[0x43; 32]).unwrap());
+        // Re-adding is a no-op, not an error.
+        store.recovery_approver_add(&key, "backup card", 1_700_000_100).unwrap();
+        assert!(store.recovery_approver_is_registered(&key).unwrap());
     }
 }
 

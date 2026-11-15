@@ -37,6 +37,7 @@ use prost::Message as _;
 use discovery::{discover_peers, DiscoveryConfig};
 use gossip::GossipService;
 use proto::{Envelope, EnvelopeHeader, NodeRegistration};
+use sha2::{Digest, Sha256};
 use store::Store;
 use validation::GossipValidationConfig;
 
@@ -211,6 +212,12 @@ fn print_usage(program: &str) {
     println!("  -p, --api-port <port>    HTTP API port (default: 8000)");
     println!("  -d, --debug              Enable debug logging");
     println!("  -h, --help               Show this help message");
+    println!();
+    println!("Subcommands:");
+    println!("  bootstrap-founder [--name <display name>] [--label <device label>]");
+    println!("                           Set up the founding member + first device +");
+    println!("                           backup-card recovery key on an empty node");
+    println!("                           (setup-time only; refuses once a member exists)");
 }
 
 /// Parse C-style flags over `config` (already carrying defaults
@@ -299,6 +306,210 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Founding bootstrap (`bootstrap-founder`, Phase B3)
+// ---------------------------------------------------------------------------
+
+/// The credentials a founding bootstrap creates. The private
+/// halves exist only in this struct and in the one printout the
+/// CLI makes from it — the node stores public keys, the device
+/// certificate, and the recovery *pubkey* only. Whoever runs the
+/// bootstrap moves the member/device secrets onto the founding
+/// phone and prints the recovery secret as the backup card.
+pub struct FounderBootstrap {
+    pub display_name: String,
+    pub device_label: String,
+    pub member_pubkey: [u8; 32],
+    /// 64-byte keypair bytes (seed || pubkey), as the keystore
+    /// returns them; the seed half is what a client rebuilds
+    /// its signing key from.
+    pub member_secret: [u8; 64],
+    pub device_pubkey: [u8; 32],
+    pub device_secret: [u8; 64],
+    pub recovery_pubkey: [u8; 32],
+    pub recovery_secret: [u8; 64],
+}
+
+/// Create the founding member, their first device, and the
+/// household recovery approver directly in `store`
+/// (DESIGN.md §3.2 first-boot: the setup path is the
+/// authorization, so this is a CLI, never an HTTP endpoint).
+/// Refuses when the household already has any member — after
+/// the founder exists, every join goes through the pairing
+/// flow with an approver's signature.
+pub fn bootstrap_founder_in_store(
+    store: &Store,
+    display_name: &str,
+    device_label: &str,
+    now: u64,
+) -> Result<FounderBootstrap, String> {
+    let count = store.user_count().map_err(|e| e.to_string())?;
+    if count > 0 {
+        return Err(format!(
+            "household already has {count} member(s); founding bootstrap only runs on an empty node"
+        ));
+    }
+    let mut member = keystore::MemberKeystore::new();
+    member.generate_member_key().map_err(|e| e.to_string())?;
+    let device_pubkey = member.add_device_key(device_label).map_err(|e| e.to_string())?;
+    let member_pubkey = member.member_public_key().map_err(|e| e.to_string())?;
+    let cert = identity::issue_device_certificate(&member, device_label, now, 0)
+        .map_err(|e| e.to_string())?;
+    let mut recovery = keystore::Keystore::new();
+    recovery.generate_keypair().map_err(|e| e.to_string())?;
+    let recovery_pubkey = recovery.get_public_key().map_err(|e| e.to_string())?;
+
+    store
+        .user_register(&member_pubkey, display_name)
+        .map_err(|e| e.to_string())?;
+    store.device_add(&cert, now).map_err(|e| e.to_string())?;
+    store
+        .recovery_approver_add(&recovery_pubkey, "backup card", now)
+        .map_err(|e| e.to_string())?;
+    let cert_hash: [u8; 32] = Sha256::digest(cert.encode_to_vec()).into();
+    store
+        .enrollment_insert(&store::EnrollmentRecord {
+            id: 0,
+            member_pubkey,
+            device_pubkey,
+            cert_hash,
+            approver_kind: "founder".to_string(),
+            approver_member_pubkey: None,
+            approver_device_pubkey: None,
+            recovery_pubkey: None,
+            approval_signature: Vec::new(),
+            approval_timestamp: now,
+            created_at: now,
+        })
+        .map_err(|e| e.to_string())?;
+
+    let member_secret = member
+        .member_keystore()
+        .get_private_key()
+        .map_err(|e| e.to_string())?;
+    let device_secret = member
+        .device_keystore(device_label)
+        .ok_or_else(|| "device keystore missing after generation".to_string())?
+        .get_private_key()
+        .map_err(|e| e.to_string())?;
+    let recovery_secret = recovery.get_private_key().map_err(|e| e.to_string())?;
+    Ok(FounderBootstrap {
+        display_name: display_name.to_string(),
+        device_label: device_label.to_string(),
+        member_pubkey,
+        member_secret,
+        device_pubkey,
+        device_secret,
+        recovery_pubkey,
+        recovery_secret,
+    })
+}
+
+/// `tinyweb bootstrap-founder [--name N] [--label L]`: the
+/// setup-time-only founding path. Runs against the same
+/// `state/storage/tinyweb.db` the node serves (run it from the
+/// node's home directory, with the node stopped or running —
+/// the store is WAL and the write is one short burst).
+fn bootstrap_founder(args: &[String]) -> i32 {
+    let mut name = "Founder".to_string();
+    let mut label = "phone".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: --name needs a value");
+                    return 1;
+                };
+                name = value.clone();
+                i += 2;
+            }
+            "--label" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("error: --label needs a value");
+                    return 1;
+                };
+                label = value.clone();
+                i += 2;
+            }
+            "-h" | "--help" => {
+                println!("Usage: tinyweb bootstrap-founder [--name <display name>] [--label <device label>]");
+                println!("Creates the founding member, their first device, and the backup-card");
+                println!("recovery key on an empty node. Prints the secrets ONCE; the node");
+                println!("stores only public keys. Refuses if any member already exists.");
+                return 0;
+            }
+            other => {
+                eprintln!("error: unknown bootstrap option: {other}");
+                return 1;
+            }
+        }
+    }
+    if let Err(e) = ensure_state_directories() {
+        eprintln!("error: failed to create state directories: {e}");
+        return 1;
+    }
+    let db_path = database_path();
+    let store = match Store::open(&db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "error: failed to open database at {}: {e}",
+                db_path.display()
+            );
+            return 1;
+        }
+    };
+    if let Err(e) = store.init_schema() {
+        eprintln!("error: failed to initialise store schema: {e}");
+        return 1;
+    }
+    let boot = match bootstrap_founder_in_store(&store, &name, &label, now_epoch()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: founding bootstrap refused: {e}");
+            return 1;
+        }
+    };
+    println!("=================================================================");
+    println!("FOUNDING MEMBER CREATED");
+    println!("The secrets below are shown ONCE and are not stored on this node.");
+    println!("Move the member + device secrets onto the founding phone now.");
+    println!("=================================================================");
+    println!("Display name:          {}", boot.display_name);
+    println!("Member pubkey:         {}", hex_encode(&boot.member_pubkey));
+    println!(
+        "Member secret (seed):  {}",
+        hex_encode(&boot.member_secret[..32])
+    );
+    println!("Device label:          {}", boot.device_label);
+    println!("Device pubkey:         {}", hex_encode(&boot.device_pubkey));
+    println!(
+        "Device secret (seed):  {}",
+        hex_encode(&boot.device_secret[..32])
+    );
+    println!("-----------------------------------------------------------------");
+    println!("BACKUP CARD — print this and keep it in the box:");
+    println!("Recovery pubkey:       {}", hex_encode(&boot.recovery_pubkey));
+    println!(
+        "Recovery secret (seed): {}",
+        hex_encode(&boot.recovery_secret[..32])
+    );
+    println!("The recovery secret can approve a replacement phone or member");
+    println!("even if every phone is lost. Anyone holding it can approve a");
+    println!("join — keep the card somewhere safe.");
+    println!("=================================================================");
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +608,13 @@ fn install_signal_handlers() {
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
     let program = argv.first().cloned().unwrap_or_else(|| "tinyweb".to_string());
+
+    // Setup-time subcommand (Phase B3 founding bootstrap): not
+    // a node flag, and it must not fall through to the C-style
+    // flag parser below.
+    if argv.get(1).map(|s| s.as_str()) == Some("bootstrap-founder") {
+        return bootstrap_founder(&argv[2.min(argv.len())..]);
+    }
 
     let mut config = NodeConfig::default();
     apply_env_overrides(&mut config);
@@ -734,5 +952,35 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.max_clock_skew_seconds = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn bootstrap_founder_creates_founder_and_refuses_a_second_run() {
+        let store = Store::open_in_memory().unwrap();
+        store.init_schema().unwrap();
+        let now = 1_700_000_000;
+        let boot = bootstrap_founder_in_store(&store, "Founder", "phone", now).unwrap();
+        // The founder is fully enrolled: active member, trusted
+        // device, recovery key registered, audit record written.
+        assert!(store.user_exists(&boot.member_pubkey));
+        assert!(store
+            .device_is_trusted(&boot.member_pubkey, &boot.device_pubkey, now)
+            .unwrap());
+        assert!(store
+            .recovery_approver_is_registered(&boot.recovery_pubkey)
+            .unwrap());
+        let enrollments = store.enrollments_for_member(&boot.member_pubkey).unwrap();
+        assert_eq!(enrollments.len(), 1);
+        assert_eq!(enrollments[0].approver_kind, "founder");
+        assert!(enrollments[0].approval_signature.is_empty());
+        // The returned secrets correspond to the stored pubkeys
+        // (seed || pubkey keypair bytes).
+        assert_eq!(&boot.member_secret[32..], &boot.member_pubkey[..]);
+        assert_eq!(&boot.device_secret[32..], &boot.device_pubkey[..]);
+        assert_eq!(&boot.recovery_secret[32..], &boot.recovery_pubkey[..]);
+        // A second bootstrap is refused and changes nothing.
+        let again = bootstrap_founder_in_store(&store, "Second", "phone", now);
+        assert!(again.is_err());
+        assert_eq!(store.user_count().unwrap(), 1);
     }
 }
